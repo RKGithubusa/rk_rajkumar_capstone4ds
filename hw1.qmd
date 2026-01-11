@@ -1,0 +1,35 @@
+---
+title: "Capstone Homework 1"
+author: "Arkay Raj"
+format: pdf
+---
+
+# Question 1: Introduction
+
+**Arkay Raj (Karan)** I reside in Philadelphia, PA, and work as an HR Data Engineer at a staffing firm. I am completing my MS in Data Science at UWF (started 2022) and hold a prior Master's in Construction Management from UIUC. My interests include Machine Learning, Data Engineering, and task automation via the Power Platform.
+
+![Introduction Post](hw1_intro.jpg){width=70%}
+
+# Question 2: Discord Channel
+
+I have joined the course Discord server.
+
+![Discord Join](hw1_discord.png){width=70%}
+
+# Question 3: Tentative Topic
+
+My tentative topic is **Drivers of Attrition: An Application of the MARS Model**.
+
+I plan to use Machine Learning (Random Forest and Logistic Regression) to predict employee turnover by operationalizing McShane & Von Glinow’s **MARS Model** (Motivation, Ability, Role Perceptions, Situational Factors). I will map dataset features to these four pillars to determine which behavioral driver is the strongest predictor of attrition.
+
+# Question 4: Google Document
+
+I have added my topic to the shared document.
+
+![Google Doc Sign-up](hw1_gdoc.jpg){width=90%}
+
+# Question 5: Reporting Method
+
+I will be using **GitHub** to present my progress and research reports for this course.
+
+**Repository Link:** [https://github.com/RKGithubusa/rk_rajkumar_capstone4ds](https://github.com/RKGithubusa/rk_rajkumar_capstone4ds)
