@@ -1,0 +1,61 @@
+---
+title: "Week 6: Capstone Introduction"
+author: "(Karan) RK Rajkumar"
+date: today
+format: 
+  pdf:
+    code-overflow: wrap
+    code-block-bg: true
+    code-block-border-left: "#31BAE9"
+    number-sections: false
+    colorlinks: true
+bibliography: references.bib
+csl: ieee.csl
+---
+
+# 1. Introduction
+
+## 1.1 Problem Definition
+
+Enterprise turnover costs have long hampered organizations in translating their human capital into profitability and performance. This is more apparent the higher up the value chain an employee is situated or the more specialized an occupation the employee works in. Industry organizations like SHRM which aver that the total **replacement costs can often range between 50 and 200 % of the annual salary** of the departing employee [@shrm2024]. 
+
+The deleterious effects of vacated critical high value roles transcend diminished output in that they also materialize as bottlenecks that place cumbersome workloads on the remaining staff, this is no small part owing to information or knowledge siloing in specialty roles [@evans_disruption_2026]. 
+
+Traditional HR practices in turnover mitigation have been limited to ex post facto analyses (e.g., exit interviews) that amount to forensic examinations of departure with minimal interventional opportunity. These approaches often frame turnover events as lone points of catastrophic failure and in doing so neglect to account for the attenuative nature of turnover. 
+
+For instance, in a 2025 Survey, McKinsey reported that 28-36% of all workers report experiencing burnout [@mckinsey_office_practices]. When considered with Gallup’s findings in 2017 that only 3 in 10 employees believe their opinions are meaningfully considered by the organizations employing them [@gallup_psychological_safety], these trends underscore the necessity of HCM and HR Data infrastructure that is robust in being able to proactively flag attrition flight risks before the turnover event occurs.
+
+## 1.2 Context and Background
+
+Among the ever-present and scantly discussed challenges of the application of Predictive modeling and machine learning in the HR space lies the efficacy of the model architect(s) in disseminating abstract mathematical results from modelling (like model coefficients and gini importance) to HR managers in a format intuitive and intelligible to them.
+
+To bridge this ravine, we will turn to McShane & Von Glinlow’s MARS Model of Individual Behavior and channel it’s application to feature categorization for a more robust interpretation of model results [@mcshane2024]. The MARS model comes to us from the field of Organizational Behavior and avers that employee behavior can be explained by four pillars:
+
+* **Motivation (M)** : Intrinsic factors that drive employee performance (like agreeableness, initiative etc)
+* **Ability (A)**: These represent both natural abilities and acquired skills of employees
+* **Role Perception (R)**: These factors represent an employee’s understanding of their role in the organization and what is expected of them.
+* **Situational Factors (S)**: These factors encompass all conditions that are external to the locus of control of the employee such as time, legal and regulatory environment, macroeconomic conditions etc.
+
+Furthermore, the success of past studies in demonstrating that these pillars directly govern employee behavior merits the exploration of the MARS framework as an interpretive lens in this study [@manik2017impact].
+
+Foundational literature in the realm of Statistical modeling had established a consensus around the theory that drive for high predictive accuracy must supersede interpretability [@breiman2001statistical]. This is because at the time, algorithmic modeling was seen as an amelioration of the rigid and inflexible stochastic models that preceded them. This theory however has been increasingly nuanced by recent scholarship where concepts like  *“Rashomon Sets”* have been employed to argue that for every dataset where there exists a finite number of predictive models, there must exist one interpretable model among them [@rudin2019stop]. This lends credence to the viability of interpretable models in producing accurate results that are statistically no different than black box models.
+
+Black box approaches also fail at attributing and locating causal links between attrition factors and turnover events which have been brought to light by scholars like Tambe et al. as looming legal and compliance risks for Enterprise HR teams [@tambe2019artificial]. Therefore this Capstone study will seek to reject complex ensemble methods in favor of inherently interpretable models like Logistic Regression and Decision Trees to generate actionable odds ratios and logical rules rather than opaque flight-risk scores.
+
+## 1.3 Objectives and Goals
+
+The choice of *model evaluation metric* is often one of the most pivotal decisions undertaken by a model architect and must pay fidelity to domain or industry specific realities of the dataset at hand. Consequently, In Enterprise HR settings, `Recall` is often favored as metric of choice in Attrition Classification studies as the **false negatives** recall represents are lost turnover intervention opportunities where as **false positives** from `precision` usually amount to a  surplus of retention “check-in” conversations with employees that can be more easily absorbed by the enterprise. We will therefore implement `Recall` as one of the primary metrics driving model selection and understanding.
+
+`F1 scores` will complement the use of `Recall` as an evaluative metric in this model as `precision` and `recall` mathematically must involve a tradeoff and `F1 scores` offer a balanced look at the model’s overall performance that exceed the value of simple `accuracy` scores which can be inflated by class imbalanced datasets.
+
+Given that the ultimate and foremost objective of this Capstone Study is the construction of a turnover classification modeling pipeline that surpasses binary `yes/no` label predictions with actionable insights like the aforementioned *odds ratios* and *decision rules*, the outputs emanating from Models constructed in this study will be mapped to the **MARS framework** in the hope that enterprise stakeholders can design targeted retention interventions.
+
+## 1.4 Summary of Approach
+
+To fashion the interpretable attrition classification models requisite to this study, at first standard data cleaning practices will be applied to the datasets employed by this study. After this a benchmark `logistic regression` model is trained on the data with no tuning measures performed to serve as a true baseline. The benchmark will be contrasted with `Regularized Logistic Regression`, `Linear Support Vector Machine` (or `Linear SVM`), `k Nearest Neighbors` classifier (`kNN`), `Decision Trees` and `Generalized Additive Models` (or `GAM’s`). Post hoc and *diagnostic tests* will be conducted for each model followed by a consolidated summary or tabulation for model performance which will include an extrapolation of model *feature importance* to **MARS** criteria outlined above to suture the mathematical insights produced to HR context and understanding.
+
+\newpage
+
+# References
+::: {#refs}
+:::
