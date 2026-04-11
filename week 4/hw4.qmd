@@ -341,6 +341,12 @@ END FOR
 ```
 
 ```{python}
+from sklearn.preprocessing import LabelEncoder
+
+# Force the master target variable into strict integers before any splitting
+le = LabelEncoder()
+y = le.fit_transform(y)
+
 #A scaling object is created below and applied to the X values to create X_sc an object containing Scaled X values#
 scaling_obj = MinMaxScaler()
 X_sc = scaling_obj.fit_transform(X)
@@ -349,10 +355,9 @@ X_sc = scaling_obj.fit_transform(X)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15,
 random_state=16, stratify=y)
 
-#Train and Test variables created for Scaled data, the unscaled y variables can be reused with Scaled X variables as these do not change through the application of Scaling#
-X_train_sc,X_test_sc = train_test_split(X_sc, y, test_size=0.15,
+#Train and Test variables created for Scaled data, the unscaled y variables can be reused with Scaled X variables as these do not change through the appli
+X_train_sc, X_test_sc = train_test_split(X_sc, y, test_size=0.15,
 random_state=16, stratify=y)[:2]
-
 
 ```
 

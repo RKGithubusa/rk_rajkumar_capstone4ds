@@ -13,9 +13,9 @@ bibliography: references.bib
 csl: ieee.csl
 ---
 
-# 2. Methods
+# Methods {#sec-methods}
 
-## 2.1 Data Architecture and Scaling Strategy
+## Data Architecture and Scaling Strategy {#sec-data-strategy}
 
 The MARS model infused ML pipeline established in the prior section of this capstone will assessed using 3 datasets as part of a broader horizontal scaling strategy to substantiate its real word applications. Therefore the datasets used herein will be the IBM dataset[@pavansubhasht_2017] which will be employed as a baseline for methodological and code calibration, the Edward Edward Babushkin Employee Turnover dataset [@babushkin_2017] to grapple with feature sparsity and finally, the Data Scientist Job Change dataset[@arashnic_2020] intended as a computational test set due to its comparatively larger size.
 
@@ -62,7 +62,7 @@ Finally **Situational** factors will be accounted for via the `city_development_
 
 **Data Pre-processing Summary:** The heterogeneous origins of the datasets employed by this study necessitate standardization through a strict, uniform preprocessing pipeline before being fed into Python’s scikit-learn algorithms which will underpin the computational engine of this MARS-Machine Learning pipeline. Given the unintelligibility of plain text strings like `industry` or `commute method` to machine learning models, One-Hot Encoding will be performed to reorient these features to binary sparse matrices (0s and 1s). The ubiquity of magnitude disparities encountered in numerical columns will further compel the use of a scaling strategy like MinMax Scaling which normalize numerical features so that algorithms reliant on spatial geometry and Euclidean distance (like Linear SVM and kNN) are not mathematically distorted by arbitrarily large values. To meet the challenge of missing categorical data (as encountered in the Data Science Job Change dataset), Constant Imputation will be utilized as this study’s imputation strategy of choice given that record elimination would result in an infeasible training or sample set size and that modal imputation (imputing each column with the most frequently occurring label) would mathematically distort the reality of the data. The Constant Imputation method stipulates that missing values are uniformly filled with a new standalone string class called `Unknown`. Doing so will allow algorithms availed in this study to evaluate if the sheer lack of enterprise data in itself is actually a predictive behavioral signal for attrition.
 
-## 2.2 Mathematical Frameworks
+## Mathematical Frameworks {#sec-capstone-math}
 
 The properly establish statistical validity and pattern generalizability across the disparate datasets used in this study and in keeping with Tambe's framework for modern HR analytics, the predictive architecture constructed there in will be underpinned by a comparative panel of six distinct classification algorithms: Standard Logistic Regression, Regularized Logistic Regression ( featuring an L2 or Ridge Penalty), Linear Kernel SVM, Decision Tree Classifier,  the k-Nearest Neighbors Classifier algorithm and a Generalized Additive Model (GAMs)
  
@@ -124,7 +124,7 @@ Given that the catalogue of features between the three datasets used in this stu
 
 
 
-**2.3 Experimental Design and Analytical Procedures**
+## Experimental Design and Analytical Procedures {#sec-capstone-exp-design}
 
 In congruence with standard best practices in machine learning methodology this study will employ an 85/15 train-test split employed across all datasets to alleviate the danger of overfitting the data at hand. Additionally, in paying fidelity to the protocols of Mantovani et al. [@mantovani2016hyperparameter], tools like `RandomizedSearchCV` from the scikitlearn library are used to iterate through hyperparameter grids to find the mathematically optimal configuration before final predictions.
  
@@ -194,7 +194,7 @@ OUTPUT: Evaluated Models (A-F), Classification Summary Reports, Variable Importa
             
     END FOR
 ```
-**2.4 Software and Tools**
+## Software and Tools {#sec-capstone-software}
 
 Python 3 will function as the computational engine of this study with the preponderance of data ingestion, manipulation, and array handling (like dealing with the Babushkin dataset's sparsity) executed in the `pandas` and `numpy` libraries.
  
@@ -204,6 +204,14 @@ Renderings of the visual array of diagnostic plots like Shapely plots (derived v
  
 Finally, all computations herein are executed locally utilizing standard CPU resources via a Jupyter/Quarto environment.
 
+
+## Ethical Considerations and Bias Mitigation {#sec-capstone-bias}
+
+Enterprise HR data is among the most sensitive flavors of data produced by most corporations due to an abundance of demographic information like race, sex and age as well as compensatory information like wage and bonus information. Hence, the three principal datasets used in this study have been scrubbed of Personally Identifiable Information (PII) prior to ingestion to sew up baseline confidentiality.
+ 
+Additionally, the experimental design implemented in this study rejects such variables implicitly due to the general inapplicability of demographic variables to MARS factors, and thereby this demographic-agnostic approach serves as a structural safeguard for privacy and prevents algorithms from anchoring on protected classes.
+ 
+The deliberate choice of interpretable models assembled in this study (Models A through F) and record-level post-hoc diagnostics like SHAP illuminate HR stakeholders as to why a flight risk flag was generated and consequently ensures retention interventions are equitable and guarded from hidden algorithmic bias.
 
 \newpage
 
