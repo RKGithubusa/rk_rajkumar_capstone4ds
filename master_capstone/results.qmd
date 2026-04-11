@@ -1,0 +1,2151 @@
+
+
+# Capstone Results & Discussion {#sec-capstone-res-ovr}
+
+```{python}
+# 1. Environment Setup & Dependencies
+# %pip install matplotlib seaborn scikit-learn shap pygam
+import warnings
+import re
+import textwrap
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import Markdown, display
+
+# Modeling Libraries & Preprocessing
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier, plot_tree, export_text, _tree
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.feature_selection import SelectKBest, f_classif
+from pygam import LogisticGAM, s, f  
+
+# Metrics, Diagnostics & Explainability
+from sklearn.metrics import recall_score, f1_score, confusion_matrix, classification_report, accuracy_score, ConfusionMatrixDisplay
+from sklearn.inspection import permutation_importance
+import shap
+
+# --- Global Formatting Options ---
+pd.set_option('display.max_columns', 10)      
+pd.set_option('display.width', 70)            
+pd.set_option('display.expand_frame_repr', True) 
+
+# Load the Initial Dataset
+ibm = pd.read_csv("ibm.csv")
+```
+
+
+```{python}
+# 2. MARS Feature Extraction
+mars_vars = [
+    # Target Variable
+    'Attrition',
+    
+    # Motivation 
+    'JobSatisfaction', 
+    'TrainingTimesLastYear', 
+    'StockOptionLevel',
+    
+    # Ability 
+    'PerformanceRating', 
+    'Education', 
+    'EducationField', 
+    'YearsAtCompany',
+    
+    # Role Perception
+    'Department', 
+    'JobLevel', 
+    'YearsWithCurrManager', 
+    'YearsInCurrentRole',
+    
+    # Situational Factors 
+    'DistanceFromHome', 
+    'OverTime', 
+    'BusinessTravel', 
+    'EnvironmentSatisfaction'
+]
+
+# Create the specific dataframe for analysis
+ibm_trunc = ibm[mars_vars].copy()
+
+
+
+```
+
+```{python}
+
+# 3. Categorical Encoding, Scaling & Train-Test Split (IBM Dataset)
+
+# Binary encode Attrition and OverTime
+binary_dict = {'Yes': 1, 'No': 0}
+ibm_trunc.Attrition = ibm_trunc.Attrition.replace(binary_dict)
+ibm_trunc.OverTime = ibm_trunc.OverTime.replace(binary_dict)
+
+# Manually encode ordinal/low-cardinality categorical variable (BusinessTravel)
+travel_dict = dict(zip(ibm_trunc.BusinessTravel.unique(), [1, 2, 0]))
+ibm_trunc.BusinessTravel = ibm_trunc.BusinessTravel.replace(travel_dict)
+
+# Separate Dependent (y) and Independent (X) variables
+ibm_y = ibm_trunc.Attrition.values
+ibm_X_vals = ibm_trunc.drop(['Attrition'], axis=1)
+
+# One-hot encode the remaining nominal categorical columns (EducationField, Department)
+ibm_X_vals = pd.get_dummies(ibm_X_vals)
+
+# --- Append MARS Tags to Feature Names ---
+# We map the base features to their respective MARS categories based on your Section 2 definitions
+mars_tag_map = {
+    'JobSatisfaction': '(M)', 'TrainingTimesLastYear': '(M)', 'StockOptionLevel': '(M)',
+    'PerformanceRating': '(A)', 'Education': '(A)', 'EducationField': '(A)', 'YearsAtCompany': '(A)',
+    'Department': '(R)', 'JobLevel': '(R)', 'YearsWithCurrManager': '(R)', 'YearsInCurrentRole': '(R)',
+    'DistanceFromHome': '(S)', 'OverTime': '(S)', 'BusinessTravel': '(S)', 'EnvironmentSatisfaction': '(S)'
+}
+
+ibm_X_labels = []
+for col in ibm_X_vals.columns:
+    tag = ''
+    for base_feature, mars_tag in mars_tag_map.items():
+        # Using startswith() ensures one-hot encoded columns (like 'Department_Sales') catch the base tag
+        if col.startswith(base_feature):
+            tag = mars_tag
+            break
+    ibm_X_labels.append(f"{col} {tag}")
+
+# Assign the updated labels back to the dataframe and extract values
+ibm_X_vals.columns = ibm_X_labels
+ibm_X = ibm_X_vals.values
+
+# Encoding target as integers to avoid model dtype warnings later
+le = LabelEncoder()
+ibm_y = le.fit_transform(ibm_y)
+
+# MinMax scaling needed since SVM and kNN rely on distance metrics
+scaling_obj = MinMaxScaler()
+ibm_X_sc = scaling_obj.fit_transform(ibm_X)
+
+# Create unscaled train/test splits (Used for Decision Trees)
+ibm_X_train, ibm_X_test, ibm_y_train, ibm_y_test = train_test_split(
+    ibm_X, ibm_y, test_size=0.15, random_state=16, stratify=ibm_y
+)
+
+# Create scaled train/test splits (Used for Linear Models, SVM, and kNN)
+# The unscaled y variables are safely reused here because class labels do not change during feature scaling
+ibm_X_train_sc, ibm_X_test_sc = train_test_split(
+    ibm_X_sc, ibm_y, test_size=0.15, random_state=16, stratify=ibm_y
+)[:2]
+
+
+```
+
+```{python}
+
+def get_top_kill_zones(tree_model, feature_names, target_names, n_zones=3):
+    tree_ = tree_model.tree_
+    feature_name = [
+        feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
+        for i in tree_.feature
+    ]
+
+    paths = []
+    
+    # Extract the raw, unweighted headcount of the entire training dataset
+    raw_total_headcount = tree_.n_node_samples[0]
+
+    def recurse(node, path):
+        if tree_.feature[node] != _tree.TREE_UNDEFINED:
+            name = feature_name[node]
+            threshold = tree_.threshold[node]
+            # Left child (True condition: <= threshold)
+            recurse(tree_.children_left[node], path + [f"{name} <= {threshold:.2f}"])
+            # Right child (False condition: > threshold)
+            recurse(tree_.children_right[node], path + [f"{name} > {threshold:.2f}"])
+        else:
+            # Terminal Leaf: Calculate concentration using weighted scores
+            val = tree_.value[node][0]
+            attrition_count = val[1]  # Class 1 is Attrition
+            total_count = sum(val)
+            
+            # Extract the raw, unweighted headcount for this specific leaf
+            raw_leaf_headcount = tree_.n_node_samples[node]
+            
+            # Avoid division by zero
+            if total_count > 0:
+                attrition_rate = attrition_count / total_count
+                
+                # Calculate what percentage of the raw workforce falls into this leaf
+                workforce_pct = (raw_leaf_headcount / raw_total_headcount) * 100
+                
+                paths.append((attrition_rate, attrition_count, total_count, raw_leaf_headcount, workforce_pct, path))
+
+    recurse(0, [])
+    
+    # Sort paths by highest attrition rate first
+    top_paths = sorted(paths, key=lambda x: x[0], reverse=True)[:n_zones]
+
+    #print(f"=== Top {n_zones} Attrition Kill Zones Found ===")
+    for i, (rate, count, total, raw_hc, wpct, path) in enumerate(top_paths, 1):
+        print(f"\nKill Zone {i}: {rate:.1%} Attrition Concentration")
+        print(f"Impact: {count:.1f}/{total:.1f} weighted score (Applies to {raw_hc} actual employees | {wpct:.2f}% of workforce)")
+        
+        # Wrapping the text at 85 chars so it doesn't run off the right side of the PDF
+        logic_string = "Logic Path: " + " AND ".join(path)
+        print(textwrap.fill(logic_string, width=85))
+```
+
+
+
+
+```{python}
+# An empty dictionary is created to store the results of model evaluations
+results_dict = {
+    'model name': [],
+    'tuned hyperparameters': [],
+    'specificity': [],
+    'sensitivity': [],
+    'f1 score': []
+}
+
+test_labels = ['Retained', 'Terminated']
+
+def classification_summary(y_test, y_pred, model_name, tuned_params="Baseline (Untuned)", show_visuals=False):
+    """
+    Takes in predicted and true labels, appends metrics to a global dictionary,
+    and optionally produces a Confusion Matrix diagram and classification summary.
+    
+    Args:
+        y_test (ndarray): True labels for the test set
+        y_pred (ndarray): Predicted labels for the test set
+        model_name (str): The name of the model for storage and display
+        tuned_params (dict or str): Optimal parameters from grid search or manual input
+        show_visuals (bool): Toggle to print the classification report and plot the confusion matrix.
+    """
+    # Calculate metrics
+    cm = confusion_matrix(y_test, y_pred)
+    cr = classification_report(y_test, y_pred, output_dict=True)
+    
+    # Clean parameter formatting for the final DataFrame
+    if isinstance(tuned_params, dict):
+        # We strip the bulky 'class_weight' dictionary out so it doesn't wreck the pandas table formatting
+        clean_params = {k: v for k, v in tuned_params.items() if k != 'class_weight'}
+        param_str = str(clean_params)
+    else:
+        # Handles manual string inputs like "k=5" for kNN
+        param_str = str(tuned_params)
+        
+    # Append the model performance results to results_dict
+    results_dict['model name'].append(model_name)  
+    results_dict['tuned hyperparameters'].append(param_str)
+    results_dict['specificity'].append(cr['0']['recall'])
+    results_dict['sensitivity'].append(cr['1']['recall'])
+    results_dict['f1 score'].append(cr['weighted avg']['f1-score'])
+
+    # Toggle visual output
+    if show_visuals:
+        cr_display = classification_report(y_test, y_pred)
+        conf_vis = ConfusionMatrixDisplay(cm, display_labels=test_labels)
+        
+       # print(f'\n--- Evaluation for {model_name} ---')
+      #  print(f'Hyperparameters: {param_str}')
+      #  print(f'The confusion matrix for the {model_name} model is:')
+        
+        fig, ax = plt.subplots(figsize=(4.8, 3.2))
+        conf_vis.plot(cmap='magma_r', ax=ax)
+        plt.show()
+        
+        print(f'The classification report for the {model_name} model is:')
+        print(cr_display)
+
+```
+
+
+## Results: IBM Dataset {#sec-ibm-res}
+
+Here the IBM dataset is pruned to conform to the MARS paradigm, given that the data was heavily skewed towards retiention (i.e the target variable had many more instances of retention than attrition), a Python dictonary of class weights is created to force the model's hand in prioritizing attrition. While non-informative columns are dropped as they were with the IBM dataset in this study, the native `profession` column from the Babushkin dataset (which is a multi factor categorical column indicating the specialization of an employee) will be tranformed into the binary `hr_profession` variable as exempting this variable from transformation will have compelled the models in this pipeline to split on highly sparse, fragmented categories for the remaining 50% of the company not engaged in HR roles thereby diluting the predictive power of the feature
+considerably. Hence this transformation forces the analytical pipeline to confront a highly specific binary question: Does being an HR insider structurally alter an employee's
+retainability by the organizations that employ them?. The forthcoming sections will serve to answer this query.
+
+
+```{python}
+# --- CLEAN PRE-PROCESSING CONSOLE LOG ---
+
+# Compute raw weights
+ibm_raw_weights = compute_class_weight(y=ibm_y, class_weight='balanced', classes=np.unique(ibm_y))
+
+# Converting numpy floats to native python types so it prints cleanly
+ibm_weights_dict = {int(cls): round(float(weight), 2) for cls, weight in zip(np.unique(ibm_y), ibm_raw_weights)}
+
+# Single-line consolidated print statement
+
+print(f"IBM Dataset Pipeline | Shape Filtered: {ibm.shape} -> {ibm_trunc.shape}\nComputed Imbalance Weights: {ibm_weights_dict}")
+
+print("\nFinal MARS-Tagged Features:") 
+for label in ibm_X_labels:
+    print(f" - {label}")
+
+
+```
+
+### Confusion Matrix Display & Analysis (IBM Dataset) {#sec-ibm-cmatrix}
+
+@fig-ibm-cmatrix below represents a **confusion matrix** which is a visualzation that employs a square N x N marix summarizing a **Classification model**'s performance by
+mapping true class labels against their predicted counterparts obtained from the **classifiers**. It also allows for calculating key **performance metrics** that were discussed in the Methods section of this study like **precision**, **recall**, and **$F_1$ scores** to identify class-specific performance issues.
+
+As such, @fig-ibm-cmatrix will serve as an illustrative example of how these key **metrics** are obtained with this tecnique while future computations of these **scores** will be tabulated in summary tables to enhance interpretability and maintain control over visual overload.In terms of the analytical utility of @fig-ibm-cmatrix, it can be observed that the results gleaned in this visual serve as a teaching example of the "**Accuracy** Trap" pervasive in **Machine learning** and *attrition* studies, The **Std. Logistic Regression model** here misclassified 28 out of 36 *attriting* employees as being *retainable* while providing a reasonbaly **accuracy rate** (~85%) that could confound the naive interpreter into overstating the utility of this **model** to drive *retention* in enterprise HR settings.
+
+This failure at once justifies the use of **regularization techniques** in **linear models** and the inclusion of **distance based** and **non-linear models** in our overall methodology to offset these observed eccentricities.
+
+\clearpage
+
+```{python}
+#| label: fig-ibm-cmatrix
+#| fig-cap: "Confusion Matrix for Std Logistic Regression Model (IBM)"
+
+# --- Model A: Standard Logistic Regression ---
+ibm_lr_classifier = LogisticRegression(random_state=12)
+
+ibm_lr_classifier.fit(ibm_X_train_sc, ibm_y_train)
+
+ibm_y_pred_lr = ibm_lr_classifier.predict(ibm_X_test_sc)
+
+classification_summary(ibm_y_test, ibm_y_pred_lr, 'A: Standard Logistic Regression', show_visuals=True)
+
+```
+
+\clearpage
+```{python}
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    
+    # --- Model B: Regularized Logistic Regression ---
+    ibm_logreg_params = {
+        "C": np.linspace(0.001, 1000, 10),
+        "solver": ['newton-cg', 'saga'],
+        "penalty": ['l2'],
+        "class_weight": [ibm_weights_dict, None]
+    }
+    ibm_logreg = LogisticRegression(max_iter=10000)
+
+    ibm_logreg_grid = RandomizedSearchCV(ibm_logreg, ibm_logreg_params, random_state=6, n_iter=20, scoring='f1')
+    ibm_logreg_grid.fit(ibm_X_train_sc, ibm_y_train)
+
+    ibm_l2logreg_model = LogisticRegression(**ibm_logreg_grid.best_params_)
+    ibm_l2logreg_model.fit(ibm_X_train_sc, ibm_y_train)
+    ibm_y_pred_l2_logreg = ibm_l2logreg_model.predict(ibm_X_test_sc)
+
+    classification_summary(
+        ibm_y_test, 
+        ibm_y_pred_l2_logreg, 
+        'B: Regularized Logistic Regression', 
+        tuned_params=ibm_logreg_grid.best_params_
+    )
+
+    # --- Model C: Linear SVM ---
+    ibm_svm_params = {
+        "C": np.logspace(-3, 3, 20),
+        "class_weight": [ibm_weights_dict]
+    }
+    ibm_svm = LinearSVC(penalty='l2', loss='squared_hinge', dual=False, max_iter=20000)
+
+    ibm_svm_grid = RandomizedSearchCV(ibm_svm, ibm_svm_params, random_state=21, scoring='f1')
+    ibm_svm_grid.fit(ibm_X_train_sc, ibm_y_train)
+
+    ibm_best_svm = ibm_svm_grid.best_estimator_
+    ibm_y_pred_svm = ibm_best_svm.predict(ibm_X_test_sc)
+
+    classification_summary(
+        ibm_y_test, 
+        ibm_y_pred_svm, 
+        'C: Linear SVM (Tuned)', 
+        tuned_params=ibm_svm_grid.best_params_
+    )
+
+    # --- Model D: Decision Tree ---
+    ibm_tree_params = {
+        "max_depth": np.arange(3, 10, 2),
+        "min_samples_split": np.arange(2, 9, 1),
+        "min_samples_leaf": np.arange(20, 50, 10),
+        "criterion": ['gini', 'log_loss'],
+        "class_weight": [ibm_weights_dict, None]
+    }
+    ibm_tree = DecisionTreeClassifier()
+
+    ibm_tree_grid = RandomizedSearchCV(ibm_tree, ibm_tree_params, random_state=6, n_iter=50, scoring='f1')
+    # Note: Decision Trees use the unscaled features (ibm_X_train)
+    ibm_tree_grid.fit(ibm_X_train, ibm_y_train)
+
+    ibm_tree_model = DecisionTreeClassifier(**ibm_tree_grid.best_params_)
+    ibm_tree_model.fit(ibm_X_train, ibm_y_train)
+
+    ibm_y_pred_dt = ibm_tree_model.predict(ibm_X_test)
+
+    # If you decide to use Model D as your visual "textbook example" for the naive reader, 
+    # you can easily switch show_visuals=True here later.
+    classification_summary(
+        ibm_y_test, 
+        ibm_y_pred_dt, 
+        'D: Decision Tree', 
+        tuned_params=ibm_tree_grid.best_params_
+    )
+```
+
+```{python}
+# --- Model F: Generalized Additive Model (GAM) [OPTIMIZED] ---
+ibm_gam_sample_weights = np.array([ibm_weights_dict[cls] for cls in ibm_y_train])
+
+# OPTIMIZATION: Shrink the search space from 11 lambdas to 5 to drastically speed up render time
+ibm_gam_lams = np.logspace(-2, 2, 5)
+
+# Dropping n_splines to 10 to speed up execution and prevent overfitting the noise
+ibm_gam_model = LogisticGAM(n_splines=10)
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    ibm_gam_model.gridsearch(
+        ibm_X_train_sc, 
+        ibm_y_train, 
+        lam=ibm_gam_lams, 
+        weights=ibm_gam_sample_weights, 
+        progress=False
+    )
+
+ibm_y_pred_gam = ibm_gam_model.predict(ibm_X_test_sc)
+
+classification_summary(
+    ibm_y_test, 
+    ibm_y_pred_gam, 
+    'F: Generalized Additive Model (GAM)', 
+    tuned_params={'lam': round(float(ibm_gam_model.lam[0][0]), 3)} 
+)
+```
+
+### **kNN** Elbow Diagram & Feature Selection (IBM Dataset) {#sec-ibm-knn}
+
+**kNN Classifiers** are notoriously prone to having their geometiric distance calculations diluted by an overabundance of **model** features, therefore sklearn's `SelectKBest`
+will be used to shrink our featureset down to the 10 most influential variables, this is accomplished by by performing a one-way **Analysis of Variance (ANOVA) F-test** (by using the `f_classif` setting of this function) between each individual numerical feature and the categorical **target variable** to determine their linear dependency and then narrowing down the feature set by selecting Features with the highest resulting **F-statistic scores**.
+
+
+```{python}
+
+#| label: fig-ibm-knn
+#| fig-cap: "KNN Elbow Diagram: Attrition Recall vs. Neighbors (IBM Dataset)"
+
+# Initialize variables for the Elbow Diagram...
+
+# We use f_classif which handles the strictly positive values from MinMaxScaler
+ibm_selector = SelectKBest(score_func=f_classif, k=10)
+ibm_X_train_selected = ibm_selector.fit_transform(ibm_X_train_sc, ibm_y_train)
+ibm_X_test_selected = ibm_selector.transform(ibm_X_test_sc)
+
+ibm_selected_mask = ibm_selector.get_support()
+ibm_selected_features = np.array(ibm_X_labels)[ibm_selected_mask]
+
+print(f"kNN will now use only these {len(ibm_selected_features)} features:")
+print(ibm_selected_features)
+
+# Initialize variables for the Elbow Diagram
+ibm_neighbors = range(1, 20)
+ibm_knn_train_recall = {}
+ibm_knn_test_recall = {}
+
+for neighbor in ibm_neighbors:
+    # Initialize and Fit 
+    # Added weights='distance' to prevent the majority class from swamping the vote
+    ibm_knn = KNeighborsClassifier(n_neighbors=neighbor, weights='distance')
+    ibm_knn.fit(ibm_X_train_selected, ibm_y_train)
+    
+    # Predict
+    ibm_y_pred_train_knn = ibm_knn.predict(ibm_X_train_selected)
+    ibm_y_pred_test_knn = ibm_knn.predict(ibm_X_test_selected)
+    
+    # Calculate RECALL for the Positive Class (Attrition)
+    ibm_knn_train_recall[neighbor] = recall_score(ibm_y_train, ibm_y_pred_train_knn)
+    ibm_knn_test_recall[neighbor] = recall_score(ibm_y_test, ibm_y_pred_test_knn)
+
+# Plotting the Elbow Diagram anchored on Recall
+plt.figure(figsize=(10, 6))
+plt.title("KNN Elbow Diagram: Attrition Recall vs Neighbors (IBM Dataset)")
+plt.plot(ibm_neighbors, list(ibm_knn_train_recall.values()), label="Training Recall", marker='o')
+plt.plot(ibm_neighbors, list(ibm_knn_test_recall.values()), label="Testing Recall", marker='o')
+plt.legend()
+plt.xlabel("Number of Neighbors (k)")
+plt.ylabel("Recall (Sensitivity for Class 1: Attrition)")
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(ibm_neighbors) 
+plt.show()
+
+# Extract the exact best k dynamically based purely on max Test Recall
+ibm_best_k = max(ibm_knn_test_recall, key=ibm_knn_test_recall.get)
+print(f"Peak Performance: k={ibm_best_k} with Test Recall of {ibm_knn_test_recall[ibm_best_k]:.4f}")
+
+# Train the finalized KNN model with the optimal k
+ibm_knn_optimized = KNeighborsClassifier(n_neighbors=ibm_best_k, weights='distance')
+ibm_knn_optimized.fit(ibm_X_train_selected, ibm_y_train)
+ibm_y_pred_knn = ibm_knn_optimized.predict(ibm_X_test_selected)
+
+# Pass the final results to the silent summary tracker
+classification_summary(
+    ibm_y_test, 
+    ibm_y_pred_knn, 
+    f'E: k-Nearest Neighbors', 
+    tuned_params=f"n_neighbors={ibm_best_k}"
+)
+```
+
+Observing @fig-ibm-knn above, we discover that the **kNN algorithim** (**Model E**) identified **k = 7** as the optimal number of neighbhors, which in the realm of enterprise HR translates to an employee's *flight risk* being best obtained from a "pod" or circle of their 7 closest peers.
+
+
+
+```{python}
+# --- REFACTORED GLOBAL STORAGE INITIALIZATION ---
+
+
+# Initialize all THREE global trackers
+ibm_global_feature_importances = pd.DataFrame(columns=['Model', 'Feature', 'Importance', 'Raw_Value', 'Color'])
+bab_global_feature_importances = pd.DataFrame(columns=['Model', 'Feature', 'Importance', 'Raw_Value', 'Color'])
+ds_global_feature_importances = pd.DataFrame(columns=['Model', 'Feature', 'Importance', 'Raw_Value', 'Color'])
+
+# --- REFACTORED INGESTION FUNCTION ---
+def store_feature_importances(labels, importances, model_name, is_directional=True, dataset='IBM'):
+    """
+    Evaluates feature magnitude/direction and appends it to the global tracker.
+    Uses default kwargs to maintain backward compatibility with previous IBM code.
+    Accepted datasets: 'IBM', 'Babushkin', 'DS_Job'
+    """
+    global ibm_global_feature_importances 
+    global bab_global_feature_importances
+    global ds_global_feature_importances
+
+    # 1. Determine Colors
+    if is_directional:
+        colors = ['red' if val > 0 else 'blue' for val in importances]
+    else:
+        colors = ['grey'] * len(importances) 
+
+    # 2. Create local dataframe and force strict float types
+    local_df = pd.DataFrame({
+        'Model': model_name,
+        'Feature': labels,
+        'Importance': np.abs(importances).astype(float), 
+        'Raw_Value': np.array(importances).astype(float),          
+        'Color': colors         
+    })
+    
+    # 3. Append to the correct Global Dataframe
+    if dataset == 'IBM':
+        ibm_global_feature_importances = pd.concat([ibm_global_feature_importances, local_df], ignore_index=True)
+    elif dataset == 'Babushkin':
+        bab_global_feature_importances = pd.concat([bab_global_feature_importances, local_df], ignore_index=True)
+    elif dataset == 'DS_Job':
+        ds_global_feature_importances = pd.concat([ds_global_feature_importances, local_df], ignore_index=True)
+    else:
+        raise ValueError("Invalid dataset name provided.")
+```
+
+```{python}
+# --- POPULATE THE GLOBAL VIMS DATAFRAME ---
+# Model A: Standard Logistic Regression (Directional)
+store_feature_importances(ibm_X_labels, ibm_lr_classifier.coef_[0], 'A: Standard Logistic Regression', is_directional=True)
+
+# Model B: Regularized Ridge (Directional)
+store_feature_importances(ibm_X_labels, ibm_l2logreg_model.coef_[0], 'B: Regularized Logistic Regression', is_directional=True)
+
+# Model C: Linear SVM (Directional)
+store_feature_importances(ibm_X_labels, ibm_best_svm.coef_[0], 'C: Linear SVM (Tuned)', is_directional=True)
+
+# Model D: Decision Tree (Magnitude Only)
+store_feature_importances(ibm_X_labels, ibm_tree_model.feature_importances_, 'D: Decision Tree', is_directional=False)
+
+# Model E: kNN (Magnitude Only via ANOVA F-Scores)
+store_feature_importances(ibm_X_labels, ibm_selector.scores_, f'E: kNN (k={ibm_best_k})', is_directional=False)
+
+# Model F: Generalized Additive Model (Magnitude Only via Permutation Importance)
+# We shuffle the test set features to see which ones cause the biggest drop in accuracy
+ibm_gam_perm_imp = permutation_importance(ibm_gam_model, ibm_X_test_sc, ibm_y_test, n_repeats=5, random_state=42)
+store_feature_importances(ibm_X_labels, ibm_gam_perm_imp.importances_mean, 'F: Generalized Additive Model (GAM)', is_directional=False)
+```
+
+### Global Feature Importances (VIMS Facet Grid - IBM Dataset) {#sec-ibm-vims}
+
+While the **kNN model** above computes its insights via the construction of peer groups, it is imperitive for us to understand the Global implications of the features in overall dataset in affecting *turnover outcomes*, this is accomplished via the following facet grid of feature importances @fig-ibm-vims
+
+```{python}
+#| label: fig-ibm-vims
+#| fig-cap: "Global Feature Importance by Algorithm (IBM Dataset)"
+
+# --- REFACTORED MASTER VISUAL FUNCTION ---
+
+def plot_vims_facet_grid(dataset='IBM'):
+    global ibm_global_feature_importances
+    global bab_global_feature_importances
+    global ds_global_feature_importances
+    
+    # Select the correct dataframe to plot based on the argument
+    if dataset == 'IBM':
+        target_df = ibm_global_feature_importances
+    elif dataset == 'Babushkin':
+        target_df = bab_global_feature_importances
+    elif dataset == 'DS_Job':
+        target_df = ds_global_feature_importances
+    else:
+        raise ValueError("Invalid dataset name provided.")
+        
+    # Force the Importance column to be numeric to prevent nlargest() crashes
+    target_df['Importance'] = pd.to_numeric(target_df['Importance'])
+    
+    # Create the 3x2 grid
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(14, 18), sharex=False)
+    axes = axes.flatten()
+    
+    # Grab the unique models currently stored in the tracker
+    models = target_df['Model'].unique()
+    
+    for i, model in enumerate(models):
+        ax = axes[i]
+        model_data = target_df[target_df['Model'] == model]
+        top_10 = model_data.nlargest(10, 'Importance').sort_values('Importance', ascending=True)
+        
+        ax.barh(top_10['Feature'], top_10['Importance'], color=top_10['Color'], edgecolor='black', linewidth=0.5)
+        
+        ax.set_title(model, fontsize=14, fontweight='bold')
+        ax.tick_params(axis='y', labelsize=10)
+        ax.xaxis.grid(True, linestyle='--', alpha=0.6)
+        ax.set_axisbelow(True)
+
+    # Hide the 6th empty subplot if GAM isn't ingested yet
+    if len(models) < 6:
+        axes[5].set_visible(False)
+        
+    # Dynamic Super Title updates automatically based on the dataset argument
+    fig.suptitle(f'Global Feature Importance by Algorithm ({dataset} Dataset)\nRed = Attrition Driver | Blue = Retention Factor | Grey = Magnitude Only', fontsize=16, y=1.02)
+    
+    plt.tight_layout()
+    plt.show()
+
+plot_vims_facet_grid()
+```
+
+Readily apparent from @fig-ibm-vims above, are the elevation of `JobLevel (R)` and `YearsWithCurrManager (R)` features as universal predictors of *retention* (indicated by their representation as blue bars) via our panel of **predictive models**. Conversely OverTime_1 (S) (or being called into *Overtime shifts/labor*) is universally flagged as a top *Attrition Driver* (Red bars) or a top magnitude splitter (Grey bars).
+
+This prioritization underscores the very limited utility of *financial or compensatory recourse* to alleviate *attrition* emanating from poorly defined roles (low values of `JobLevel (R)`) or poor or experimental managerial allotment and configuration (demonstrated by low values of `YearsWithCurrManager (R)`)
+
+Also visible here is the impact of **regularization techniques** that reveal themsevles in the disparity betweeen the feature importances produced by **Models A & B**. In **Model A** `YearsAtCompany (A)` is a moderate red bar and the #9 overall factor in predicting *attrition*, however in **Model B** this feature ascends in importantance to the #1 predictor of *attrition* ostensibly due to the preponderance of multicollinear or correlated feautes that are endemic to HR datasets (e.g *tenure*, *time in role* etc).
+In penalizing this noise with an **L2 penalty**, **Model B** uncovers a harsh HR reality: Working at an organization for extended periods of time without progressing upwards in terms of *Job Level* or *seniority* or being transferred to a different manager leads to *stagnation* and *flight-risk*. In short: Decoupling *tenure* from *job mobility* can have deleterious consequences for *retention*.
+
+The **decision tree** (**Model D**) offers a unique understanding of *turnover trends* in IBM in its promotion of `OverTime_0` and `JobLevel` as predictive variables, this promotion is computational rather than accidental.*Decision trees** eschew constructing gradual slopes or **probabilities** in their endeavor to mine insights but instead use **metrics of impurity** (**gini** or **log-loss**) to find the cleanest cuts in bifuricating the workforce into *stayers* and *leavers*.
+This is most operational when HR managers require hard-and-fast operational rules to flag *flight risks* (rather than gradual **probabilities**) and in this vein **Model D** avers that overtime status (or the lack therof) provides the cleanest immediate filter.
+
+Non-linear models in the @fig-ibm-vims panel, such as the **Logistic GAM (Model F)**, underscore the primacy of targeted retention efforts like stock grants (denoted by **`StockOptionLevel (M)`**) in the IBM dataset, despite only being marginally influential in the linear models of the panel (**Models A through C**). This is likely due to the nature of linear models in forcing straight lines through the dataset; doing so in the context of **`StockOptionLevel (M)`** implies that every extra stock option confers upon the enterprise the *exact same amount of loyalty*. GAMs dispel this illusion and allow for a nuanced understanding with their usage of splines. The resulting implication here is that extrinsic motivators like compensatory rewards are not flat and can experience *diminishing returns* beyond a certain threshold, which will be explored further in the next section.
+
+### Logistic GAM Partial Dependence Plots (IBM Dataset) {#sec-ibm-gam}
+
+he **Partial Dependence Plots (PDPs)** rendered below isolate a single variable to show its exact, marginal effect on an employee's **probability** of quitting, holding all other variables constant. Within each **PDP** diagram, the X-axis represents the employee's status for that specific feature, scaled from 0.0 (lowest possible value in the dataset) to 1.0 (highest possible value). The Y axis represents the **log-odds** of our binary **target variable** (*Attrition* for the datasets employed in this study), most crucial here is the horizontal dashed line at 0.0 which can be understood in lay terms as the "*turnover line*", therefore any point on the curve above the zero line means that specific value drives the employee to depart the enterprise (higher *attrition risk*) wheras Any point below the zero-line means that value drives them to stay by acting as a *retention anchor*.
+
+```{python}
+#| label: fig-ibm-pdp
+#| fig-cap: "Non-Linear Feature Effects for Top Continuous Drivers (IBM GAM)"
+
+# --- MODEL F: PARTIAL DEPENDENCE PLOTS (STRIPPED SYNTAX) ---
+
+# 1. Extract Top 3 Features
+ibm_gam_vims = ibm_global_feature_importances[ibm_global_feature_importances['Model'] == 'F: Generalized Additive Model (GAM)']
+ibm_top_3_gam_features = ibm_gam_vims.nlargest(3, 'Importance')['Feature'].tolist()
+ibm_top_3_indices = [ibm_X_labels.index(feat) for feat in ibm_top_3_gam_features]
+
+# 2. Create the 1x3 Grid
+# Changed to 3 rows, 1 column. Adjusted figsize for vertical stacking.
+fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(10, 15))
+
+# (Keep your existing for-loop exactly the same, but remove the `if i == 0:` y-axis 
+# logic since every plot is now on the left edge and needs a y-axis label)
+
+for i, (feat, idx) in enumerate(zip(ibm_top_3_gam_features, ibm_top_3_indices)):
+    ax = axes[i]
+    
+    # Generate the grid for the specific term
+    XX = ibm_gam_model.generate_X_grid(term=idx)
+    
+    # Calculate dependence - keep 'term' here as partial_dependence requires it
+    pdp = ibm_gam_model.partial_dependence(term=idx, X=XX)
+    
+    # The model infers the term from the structure of XX. 
+    confi = ibm_gam_model.confidence_intervals(XX, width=0.95)
+    
+    # Plotting
+    ax.plot(XX[:, idx], pdp, color='purple', linewidth=2)
+    ax.fill_between(XX[:, idx], confi[:, 0], confi[:, 1], color='purple', alpha=0.2)
+    
+    # Baseline
+    ax.axhline(0, color='black', linestyle='--', linewidth=1.1)
+    
+    # Formatting
+    ax.set_title(f"PDP: {feat}", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Scaled Value (0 to 1)")
+    if i == 0:
+        ax.set_ylabel("Partial Dependence (Log-Odds)")
+    
+    ax.grid(True, linestyle=':', alpha=0.6)
+
+fig.suptitle('Non-Linear Feature Effects: Top 3 IBM Drivers (GAM)', fontsize=15, y=1.05)
+plt.tight_layout()
+plt.show()
+```
+
+Accordingly, the **PDP** plots above in @fig-ibm-pdp offer us validation in the previously concluded limited utility of *compensatory rewards*, the `StockOptionLevel (M)` plot demonstrates here that conferring a mid-tier *stock grant* on an employee buys the issuing enterprise massive *retention power* but issuing the absolute maximum *stock grant* value squanders entrpise capital in its failure to secure additional *loyalty* in proportion to the elevated stock issuance.
+
+The `JobLevel` **PDP** plot adds to our nonlinear grasp of IBM data by highlighting the prevalance of a "*Middle-management squeeze*" at IBM, *Attrition risk* starts out high for entry level employees (`JobLevel` = 0.0) drops below the zero line before again resurfacing at a middle range (`JobLevel` between 0.4 and 0.5) before its terminal plunge into *retentive safety* for Senior executives (`JobLevel` >= 0.8).This insight escaped the scrutiny of the **linear models** because they'd averged out the very same **splines** that produce these insights.**Logistic GAM** reveals here that middle managers at IBM are a considerable *flight risk* ostensibly due to them coming out on the losing end of the *stress to compensation ratio* (i.e they have comparable *workload* to senior leadership sans the lucrative *stock rewards* or the enhanced *autonomy* prevelant at the upper eschelons of an enterprise)
+
+The `YearsAtCompany` **PDP** plot offers its own cautionary tale in the form of demonstrable *tenure fatigue*. It can be observed in @fig-ibm-pdp that the curve stays below the zero line for people who are in the early or intermediate stages of their *career trajectory* (`YearsAtCompany` between 0.0 and 0.7), but once this threshold is crossed, the **log-odds** favoring *attrition* rocket upward exponentially.Translated to Enterprise HR strategy, this insight informs us that *Institutional loyalty* has an expiration date in that employees may very well be *retained* comfortably by an enterprise for several years but if they arrive at the late stages of their *tenure* without haviung been promoted or structurally re-engaged, "*tenure fatigue*" is likely to take hold and exponetiate their *attrition risk*.
+
+While the **PDP plots** from the **GAM model** offer tremendous theoretical clarity in the full spectrum observation of *workforce behavior*, their practical limitations in implementation (e.g., an HR manager cannot meaningfully deploy a "curve" into an automated alert system) necessitate the hard binary logic of **Decision Trees** to locate specific "*Kill Zones*" of *turnover* in an effort to bridge the gap between *behavioral theory* and operational HR intervention.
+
+\clearpage
+
+### Decision Tree Attrition "Kill-Zones" (IBM Dataset) {#sec-ibm-kzones}
+```{python}
+get_top_kill_zones(ibm_tree_model, ibm_X_labels, ['Stay', 'Exit'])
+```
+
+he cohort specified by Kill Zone 1 is comprised of Junior employees (`JobLevel` <= 1.50) brand new to their role (`YearsInCurrentRole` <= 0.50) who are recruited into working *overtime* (`OverTime_0` <= 0.50,`OverTime_0` must be equal to 1 to indicate the absence of *overtime* ). In an HR context this stipulates that if IBM hires new employees into brand new roles and forces them to work beyond business hours this will come at the cost of 93% percent of this cohort *attriting*, these employees would *burn out* before their *onboarding* is even completed in earnest.
+
+Kill Zone 2 represents a class of more tenured Junior employees (`JobLevel (R)` <= 1.50 AND `YearsInCurrentRole (R)` > 0.50) than in Kill zone 1, like the employees in Kill Zone 1, these employees also work *overtime* (`OverTime_0` <= 0.50) however they are uniquely beleaguered by long *commutes* to the office (`DistanceFromHome` > 12.50).
+The curative HR remedy to this issue would be thhe facilitation of additional *remote work* days or transportation stipends to alleviate the physical *exhaustion* faced by Junior employees who struggle with both extended working ours and arduous *commute* journeys.
+
+Kill Zone 3 offers a unique look at the vulnerabilities of organizational *veterancy* particularly in *Sales roles* ( `JobLevel (R)` > 1.50 AND `Department_Sales (R)` >
+0.50), this cohort also suffers from compromised *work life balance* ( OverTime_0 (S) <= 0.50) as well as the limitations of IBM's reward structure ( `StockOptionLevel (M)` <= 0.50).This logical path points to classic *sales burnout* obseved in enterprises all over the world. Experienced sales representatives are being compelled to grind beyond business hours without long-term *extrinsic rewards* to lock in their *committment*. Absent this *compensatory equity*, veteran sales staff will simply take their client books to a competitor.
+
+While **Decision Trees**, as illustrated by the 3 Kill-Zones, can produce watershed understandings of high-risk groups within an organization, HR departments ultimately concern themselves with the well-being of individuals. Managers need to know with specificity which of the employees they manage is a *flight risk*.
+To address this need, this study employs **SHAP Extreme Case Analysis** in the next section as the final proof of concept by demonstrating that the pipeline can surgically diagnose the distinct mathematical pressures acting on a single employee.
+
+```{python}
+# --- PREP DATASET FOR SHAP ---
+# Re-attaching labels for readability
+ibm_X_test_df = pd.DataFrame(ibm_X_test_sc, columns=ibm_X_labels)
+ibm_X_train_df = pd.DataFrame(ibm_X_train_sc, columns=ibm_X_labels)
+
+# --- 1. MODEL A: Standard Logistic Regression ---
+ibm_probas_a = ibm_lr_classifier.predict_proba(ibm_X_test_sc)[:, 1]
+idx_a_min, idx_a_max = np.argmin(ibm_probas_a), np.argmax(ibm_probas_a)
+ibm_explainer_a = shap.LinearExplainer(ibm_lr_classifier, ibm_X_train_df)
+ibm_shap_a = ibm_explainer_a(ibm_X_test_df)
+
+# --- 2. MODEL B: Regularized Logistic Regression ---
+ibm_probas_b = ibm_l2logreg_model.predict_proba(ibm_X_test_sc)[:, 1]
+idx_b_min, idx_b_max = np.argmin(ibm_probas_b), np.argmax(ibm_probas_b)
+ibm_explainer_b = shap.LinearExplainer(ibm_l2logreg_model, ibm_X_train_df)
+ibm_shap_b = ibm_explainer_b(ibm_X_test_df)
+
+# --- 3. MODEL C: Linear SVM ---
+ibm_scores_c = ibm_best_svm.decision_function(ibm_X_test_sc)
+idx_c_min, idx_c_max = np.argmin(ibm_scores_c), np.argmax(ibm_scores_c)
+ibm_explainer_c = shap.LinearExplainer(ibm_best_svm, ibm_X_train_df)
+ibm_shap_c = ibm_explainer_c(ibm_X_test_df)
+
+# --- 4. MODEL F: Generalized Additive Model (GAM) ---
+ibm_probas_f = ibm_gam_model.predict_proba(ibm_X_test_sc)
+idx_f_min, idx_f_max = np.argmin(ibm_probas_f), np.argmax(ibm_probas_f)
+
+# We use a smaller background sample for GAM SHAP to speed up the kernel calculation
+ibm_gam_bg = shap.sample(ibm_X_train_df, 50) 
+ibm_explainer_f = shap.Explainer(ibm_gam_model.predict, ibm_gam_bg)
+
+# Slicing just the min/max rows here, otherwise KernelExplainer takes forever to run
+ibm_shap_f_safe = ibm_explainer_f(ibm_X_test_df.iloc[[idx_f_min]], silent=True)
+ibm_shap_f_risk = ibm_explainer_f(ibm_X_test_df.iloc[[idx_f_max]], silent=True)
+
+```
+
+
+
+### **SHAP Extreme Case Analysis**: The Safe Bets & *Flight Risks* at IBM {#sec-ibm-shaps}
+
+Below in @fig-ibm-shap-safe, we notice that the massive blue bars pushing the employee's risk profile into the negative (safe/*retention*) territory are `JobLevel` and `YearsWithCurrManager`.The global insights observed in @sec-ibm-vims are validated here at the individual level in our discovery that the most *retainable* people at IBM aren't necessarily the most generously *compensated* but instead employees grounded in a deep structural *seniority* by virtue of their roles in the organization and also enjoy long standing positive *relationships with their managers*.
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-ibm-shap-safe
+#| fig-cap: "SHAP Local Interpretability: Profiles with Lowest Attrition Probability (IBM)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Safest"
+#|   - "B: Reg. Logistic Regression - Safest"
+#|   - "C: Linear SVM (Tuned) - Safest"
+#|   - "F: GAM - Safest"
+
+def render_shap_waterfall(shap_vals, plot_title):
+    # Base font size for y-axis labels
+    plt.rcParams.update({'font.size': 14})
+    
+    shap.plots.waterfall(shap_vals, max_display=8, show=False)
+    
+    fig = plt.gcf()
+    ax = plt.gca()
+    
+    # STRETCHED canvas (8x9) to perfectly fill the vertical page height
+    fig.set_size_inches(8, 8) 
+    
+    # Targeted text shrink for the inner bar magnitudes
+    for text in ax.texts:
+        t = text.get_text()
+        if t.startswith('+') or t.startswith('-'):
+            text.set_fontsize(11)
+            text.set_weight('bold')
+    
+    plt.title(plot_title, pad=20, fontweight='bold', fontsize=18)
+    plt.tight_layout()
+    plt.show()
+    
+    plt.rcParams.update({'font.size': 10})
+
+# --- THE "SAFE" ANCHORS (Lowest Probabilities) ---
+render_shap_waterfall(ibm_shap_a[idx_a_min], "")
+render_shap_waterfall(ibm_shap_b[idx_b_min], "")
+render_shap_waterfall(ibm_shap_c[idx_c_min], "")
+render_shap_waterfall(ibm_shap_f_safe[0], "")
+```
+
+The riskiest employees as seen in @fig-ibm-shap-risk are those plagued by forced *overtime* (`OverTime_1`) and critical of their environmental situation at the organization (`DistanceFromHome`).Herein lies the surgical power of **SHAP analysis** as it can be inferred from this diagnostic panel (@fig-ibm-shap-risk) that a successful *retention strategy* for these high-risk employees must manifest as schedule and *workload relief* as opposed to incremental *compensatory bonuses* like salary raises.
+
+
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-ibm-shap-risk
+#| fig-cap: "SHAP Local Interpretability: Profiles with Highest Attrition Probability (IBM)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Riskiest"
+#|   - "B: Reg. Logistic Regression - Riskiest"
+#|   - "C: Linear SVM (Tuned) - Riskiest"
+#|   - "F: GAM - Riskiest"
+
+# --- THE "FLIGHT RISKS" (Highest Probabilities) ---
+
+# (We reuse the render_shap_waterfall function we defined in the previous cell)
+
+render_shap_waterfall(ibm_shap_a[idx_a_max], "")
+render_shap_waterfall(ibm_shap_b[idx_b_max], "")
+render_shap_waterfall(ibm_shap_c[idx_c_max], "")
+render_shap_waterfall(ibm_shap_f_risk[0], "")
+```
+
+Our pipeline thus far as implemented in @sec-ibm-res successfully proves that highly accurate and indivudalistic diagnostics can be just as efficacious as those produced by
+"**black-box**" **models**. Hence, with the theoretical and diagnostic capabilities of the **models** proven, the final step in the IBM evaluation is an empirical ranking and tabulation to determine which **algorithm** actually caught the most *flight risks*.
+
+\clearpage
+
+### Model Performance Matrix (IBM Dataset) {#sec-ibm-perf-matrix}
+
+```{python}
+#| label: tbl-ibm-perf
+#| tbl-cap: "Consolidated Algorithm Performance and Hyperparameters (IBM Dataset)"
+
+# 4. Universal Performance Matrix (IBM Dataset)
+
+# Convert the populated results dictionary into a master dataframe
+ibm_performance_df = pd.DataFrame(results_dict)
+
+# Using regex to strip out numpy wrappers from the hyperparameter strings so the table looks clean
+ibm_performance_df['tuned hyperparameters'] = ibm_performance_df['tuned hyperparameters'].apply(
+    lambda x: re.sub(r"np\.\w+\(([^)]+)\)", r"\1", str(x))
+)
+
+# Rename columns to match formal Capstone rubric terminology
+ibm_performance_df = ibm_performance_df.rename(columns={
+    'specificity': 'Retention Recall (Class 0)',
+    'sensitivity': 'Attrition Recall (Class 1)',
+    'f1 score': 'F1-Score (Weighted)'
+})
+
+# Sort and rank the models by Attrition Recall (Our primary optimization metric)
+ibm_performance_df['Rank'] = ibm_performance_df['Attrition Recall (Class 1)'].rank(ascending=False, method='min')
+ibm_performance_df = ibm_performance_df.set_index('Rank').sort_index(ascending=True)
+
+# Format to 3 decimal places for a clean, academic presentation
+ibm_performance_df = ibm_performance_df.round(3)
+
+# Force Pandas to wrap text in the PDF instead of clipping it off the page
+
+#print("\n=== IBM Dataset: Consolidated Algorithm Performance ===")
+
+# Convert the dataframe to a native Markdown table so Quarto automatically wraps the text
+display(Markdown(ibm_performance_df.to_markdown()))
+
+```
+
+We see in @tbl-ibm-perf, the **Decision Tree** performs best with the primary **evaluation metric** of this study by securing an **Attrition Recall rate** of 0.75 implying that the **algorithm** successfully identifies 3 in 4 employees that actually terminated, this is in stark contrast to the untuned **baseline model** (**Model A: Std Logistic Regression**) which with an **Attrition recall** of 0.22 could only muster the successful identification of 1 in 5 *leavers* which cements **Model D** as a substantial computational upgrade to this baseline.
+
+The best holistic compromise however is **Model F** (**Logistic GAM**) which earned a near comparable primary **metric score** of 0.722 to **Model D**'s 0.75, but maintained a much higher **$F_1$ score** than its competitor in **Model D** (**$F_1$** = 0.724), this is due to its superior performance in the domain of **retention recall**.
+The enterprise HR implication of this tabulation therfore avers that while **Model D** flags the most *flight-risks*, **Model F** offers comparable performance for fewer tradeoffs as it avoids burying HR in false-positive *retention* meetings.
+
+Hence @tbl-ibm-perf validates the introductory hypothesis of this study that the evolution of data pipelines from rigid, **lineal algorithms** (**Models A through C**) into inherently transparent and interpretable **non linear models** like **GAM** and **Decision trees** not only provided superior business intelligence but also yielded the highest absolute **predictive performance**.
+
+```{python}
+# ==========================================
+# PART 2: THE BABUSHKIN DATASET PIPELINE
+# ==========================================
+# 1. Ingest the Raw Data
+# (Ensure 'babushkin.csv' is in your working directory)
+bab_df = pd.read_csv("babushkin.csv", encoding="cp1251")
+
+
+# 2. Define the MARS Features (per Week 7 Mapping)
+bab_mars_columns = [
+    'event',         # Target Variable (Attrition Flag)
+    'stag',          # Ability: Length of Service (Months)
+    'greywage',      # Situational: Compensation Method
+    'way',           # Situational: Commute Method
+    'traffic',       # Situational: Source of Hire
+    'industry',      # Role Perception: Industry Boundary
+    'profession',    # Role Perception: Profession Boundary
+    'coach',         # Role Perception: Mentorship Proxy
+    'extraversion',  # Motivation: FFM Extraversion
+    'anxiety',       # Motivation: FFM Neuroticism
+    'selfcontrol',   # Motivation: FFM Conscientiousness
+    'novator',       # Motivation: FFM Openness to Experience
+    'independ'       # Motivation: FFM Agreeableness (Reverse Scale)
+]
+
+# 3. Drop Useless Features by Filtering
+bab_df = bab_df[bab_mars_columns]
+```
+
+```{python}
+# --- 1. Binary Transformation: Greywage ---
+# if 'grey' (tax-evading), 0 if 'white' (fully compliant) {#sec-}
+bab_df['greywage'] = (bab_df['greywage'] == 'grey').astype(int)
+
+# --- 2. Binary Transformation: Profession (HR Flag) ---
+# if HR, 0 if any other profession {#sec-}
+bab_df['hr_profession'] = (bab_df['profession'] == 'HR').astype(int)
+
+# Drop the original 'profession' column since we've extracted the core signal
+bab_df = bab_df.drop('profession', axis=1)
+
+# --- 3. One-Hot Encoding: Coach and Way ---
+# Convert the nominal categories into distinct binary columns
+bab_df = pd.get_dummies(bab_df, columns=['coach', 'way'], drop_first=False, dtype=int)
+
+```
+
+```{python}
+# --- 4. Grouping & Encoding: Traffic and Industry ---
+
+# Define the mapping dictionaries
+traffic_mapping = {
+    'youjs': 'Job_Boards', 'empjs': 'Job_Boards',
+    'friends': 'Referral_Network', 'referal': 'Referral_Network', 
+    'rabrecNErab': 'Referral_Network', 'recNErab': 'Referral_Network',
+    'KA': 'Agency_Ads', 'advert': 'Agency_Ads'
+}
+
+industry_mapping = {
+    'Retail': 'Retail_Services', 'HoReCa': 'Retail_Services', 'RealEstate': 'Retail_Services', 'etc': 'Retail_Services',
+    'manufacture': 'Heavy_Industry', 'Building': 'Heavy_Industry', 'PowerGeneration': 'Heavy_Industry', 
+    'Mining': 'Heavy_Industry', 'Agriculture': 'Heavy_Industry', 'transport': 'Heavy_Industry', 'Pharma': 'Heavy_Industry',
+    'IT': 'Tech_Professional', 'Banks': 'Tech_Professional', 'Consult': 'Tech_Professional', 'Telecom': 'Tech_Professional',
+    'State': 'Public_Sector'
+}
+
+# Apply the mappings to the columns
+bab_df['traffic'] = bab_df['traffic'].map(traffic_mapping)
+bab_df['industry'] = bab_df['industry'].map(industry_mapping)
+
+# One-Hot Encode the newly grouped columns
+bab_df = pd.get_dummies(bab_df, columns=['traffic', 'industry'], drop_first=False, dtype=int)
+
+```
+
+```{python}
+# ==========================================
+# PART 3: BABUSHKIN MARS TAGGING & PREPROCESSING
+# ==========================================
+# 1. Separate Features (X) and Target (y)
+bab_y = bab_df['event']
+bab_X_vals = bab_df.drop('event', axis=1)
+
+# 2. Define the MARS Tag Map for Babushkin
+# Based on Week 7 text (lost-in-translation / Russian HR metrics)
+bab_mars_tag_map = {
+    # Ability
+    'stag': '(A)', 
+    
+    # Situational
+    'greywage': '(S)', 'way': '(S)', 'traffic': '(S)',
+    
+    # Role Perception
+    'hr_profession': '(R)', 'industry': '(R)', 'coach': '(R)',
+    
+    # Motivation (Five Factor Model)
+    'extraversion': '(M)', 'anxiety': '(M)', 'selfcontrol': '(M)', 
+    'novator': '(M)', 'independ': '(M)'
+}
+
+# 3. Append MARS Tags to Feature Names
+bab_X_labels = []
+for col in bab_X_vals.columns:
+    tag = ''
+    for base_feature, mars_tag in bab_mars_tag_map.items():
+        # Using startswith() perfectly catches our new one-hot encoded columns 
+        # (e.g., 'traffic_Job_Boards' will successfully catch the 'traffic' base tag)
+        if col.startswith(base_feature):
+            tag = mars_tag
+            break
+    bab_X_labels.append(f"{col} {tag}".strip())
+
+# Assign the updated labels back to the dataframe and extract values
+bab_X_vals.columns = bab_X_labels
+bab_X = bab_X_vals.values
+
+# 4. Target Encoding
+# Encoding target as integers to avoid model dtype warnings later
+le = LabelEncoder()
+bab_y = le.fit_transform(bab_y)
+
+# 5. Feature Scaling
+# MinMax scaling needed since SVM and kNN rely on distance metrics
+scaling_obj = MinMaxScaler()
+bab_X_sc = scaling_obj.fit_transform(bab_X)
+
+# 6. Train/Test Splitting
+# Create unscaled train/test splits (Used for Decision Trees)
+bab_X_train, bab_X_test, bab_y_train, bab_y_test = train_test_split(
+    bab_X, bab_y, test_size=0.15, random_state=16, stratify=bab_y
+)
+
+# Create scaled train/test splits (Used for Linear Models, SVM, and kNN)
+bab_X_train_sc, bab_X_test_sc = train_test_split(
+    bab_X_sc, bab_y, test_size=0.15, random_state=16, stratify=bab_y
+)[:2]
+
+```
+
+\clearpage
+
+## Results: Babushkin Dataset {#sec-bab-res}
+
+Because the Babushkin dataset was synthtecially compiled as a **balanced dataset** (there is parity between records indicating retention and termination), Thr computed class weights are {Retention: 1.01, Attrition: 0.99} owing to the abscence of a massive class imbalance in the dataset to skew the baseline. 
+
+The Babushkin dataset sees an overall increase in features inspite of dropping non-informative and demographic columns due to the *one-hot encoding technique* producing multiple binary variations of the categorical columns from the native unmodified dataset.
+
+```{python}
+
+# --- CLEAN PRE-PROCESSING CONSOLE LOG (BABUSHKIN) ---
+
+# Compute raw weights for the Babushkin dataset
+bab_raw_weights = compute_class_weight(class_weight='balanced', classes=np.unique(bab_y), y=bab_y)
+
+# Converting numpy floats to native python types so it prints cleanly
+bab_weights_dict = {int(cls): round(float(weight), 2) for cls, weight in zip(np.unique(bab_y), bab_raw_weights)}
+
+# We hardcode the original shape here in case the raw dataframe variable was overwritten during filtering
+bab_original_shape = (1129, 16)
+
+# Single-line consolidated print statement (with the \n for PDF wrapping)
+print(f"Babushkin Dataset Pipeline | Shape Filtered: {bab_original_shape} -> {bab_df.shape}\nComputed Imbalance Weights: {bab_weights_dict}")
+
+print("\nFinal MARS-Tagged Features:")
+for label in bab_X_labels:
+    print(f" - {label}")
+
+```
+
+```{python}
+# --- RESET GLOBAL DICTIONARY FOR BABUSHKIN ---
+results_dict = {
+    'model name': [],
+    'tuned hyperparameters': [],
+    'specificity': [],
+    'sensitivity': [],
+    'f1 score': []
+}
+
+bab_lr_classifier = LogisticRegression(random_state=12)
+bab_lr_classifier.fit(bab_X_train_sc, bab_y_train)
+
+bab_y_pred_lr = bab_lr_classifier.predict(bab_X_test_sc)
+
+# show_visuals explicitly set to False to prevent the confusion matrix from printing
+classification_summary(bab_y_test, bab_y_pred_lr, 'A: Standard Logistic Regression', show_visuals=False)
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    
+    # --- Model B: Regularized Logistic Regression ---
+    bab_logreg_params = {
+        "C": np.linspace(0.001, 1000, 10),
+        "solver": ['newton-cg', 'saga'],
+        "penalty": ['l2'],
+        "class_weight": [bab_weights_dict, None]
+    }
+    bab_logreg = LogisticRegression(max_iter=10000)
+
+    bab_logreg_grid = RandomizedSearchCV(bab_logreg, bab_logreg_params, random_state=6, n_iter=20, scoring='f1')
+    bab_logreg_grid.fit(bab_X_train_sc, bab_y_train)
+
+    bab_l2logreg_model = LogisticRegression(**bab_logreg_grid.best_params_)
+    bab_l2logreg_model.fit(bab_X_train_sc, bab_y_train)
+    bab_y_pred_l2_logreg = bab_l2logreg_model.predict(bab_X_test_sc)
+
+    classification_summary(
+        bab_y_test, 
+        bab_y_pred_l2_logreg, 
+        'B: Regularized Logistic Regression', 
+        tuned_params=bab_logreg_grid.best_params_,
+        show_visuals=False
+    )
+
+    # --- Model C: Linear SVM ---
+    bab_svm_params = {
+        "C": np.logspace(-3, 3, 20),
+        "class_weight": [bab_weights_dict]
+    }
+    bab_svm = LinearSVC(penalty='l2', loss='squared_hinge', dual=False, max_iter=20000)
+
+    bab_svm_grid = RandomizedSearchCV(bab_svm, bab_svm_params, random_state=21, scoring='f1')
+    bab_svm_grid.fit(bab_X_train_sc, bab_y_train)
+
+    bab_best_svm = bab_svm_grid.best_estimator_
+    bab_y_pred_svm = bab_best_svm.predict(bab_X_test_sc)
+
+    classification_summary(
+        bab_y_test, 
+        bab_y_pred_svm, 
+        'C: Linear SVM (Tuned)', 
+        tuned_params=bab_svm_grid.best_params_,
+        show_visuals=False
+    )
+
+    # --- Model D: Decision Tree ---
+    bab_tree_params = {
+        "max_depth": np.arange(3, 10, 2),
+        "min_samples_split": np.arange(2, 9, 1),
+        "min_samples_leaf": np.arange(20, 50, 10),
+        "criterion": ['gini', 'log_loss'],
+        "class_weight": [bab_weights_dict, None]
+    }
+    bab_tree = DecisionTreeClassifier(random_state=12)
+
+    bab_tree_grid = RandomizedSearchCV(bab_tree, bab_tree_params, random_state=6, n_iter=50, scoring='f1')
+    # Note: Decision Trees use the unscaled features (bab_X_train)
+    bab_tree_grid.fit(bab_X_train, bab_y_train)
+
+    bab_tree_model = DecisionTreeClassifier(**bab_tree_grid.best_params_, random_state=12)
+    bab_tree_model.fit(bab_X_train, bab_y_train)
+
+    bab_y_pred_dt = bab_tree_model.predict(bab_X_test)
+
+    classification_summary(
+        bab_y_test, 
+        bab_y_pred_dt, 
+        'D: Decision Tree', 
+        tuned_params=bab_tree_grid.best_params_,
+        show_visuals=False
+    )
+```
+
+
+```{python}
+# --- Model F: Generalized Additive Model (GAM) [BABUSHKIN OPTIMIZED] ---
+# Map the computed class weights to every individual sample in the training set
+bab_gam_sample_weights = np.array([bab_weights_dict[cls] for cls in bab_y_train])
+
+# OPTIMIZATION: Shrink the search space to 5 lambdas to drastically speed up render time
+bab_gam_lams = np.logspace(-2, 2, 5)
+
+# Dropping n_splines to 10 to speed up execution and prevent overfitting the noise
+bab_gam_model = LogisticGAM(n_splines=10)
+
+# Execute gridsearch with sample weights applied, progress bar suppressed, and math warnings silenced
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    bab_gam_model.gridsearch(
+        bab_X_train_sc, 
+        bab_y_train, 
+        lam=bab_gam_lams, 
+        weights=bab_gam_sample_weights, 
+        progress=False
+    )
+
+bab_y_pred_gam = bab_gam_model.predict(bab_X_test_sc)
+
+classification_summary(
+    bab_y_test, 
+    bab_y_pred_gam, 
+    'F: Generalized Additive Model (GAM)', 
+    tuned_params={'lam': round(float(bab_gam_model.lam[0][0]), 3)},
+    show_visuals=False
+)
+
+```
+
+### **kNN** Elbow Diagram & Feature Selection (Babushkin Dataset) {#sec-bab-knn}
+
+We observe here in the tuning of the **kNN model** that the **ANOVA F-test** employed by the Python **`SelectKBest`** function hasv iolently pruned the *Five-Factor Model (FFM) personality traits*. The features **`anxiety (M)`** (corresponds to *Neuroticism*) and **`independ (M)`** (corresponds to *Openess to Experience*) were the only two factors of the *Five-Factor Model* that met the threshold of **linear dependency** with the target variable, this selection makes salient the limited utility of *extensive personality screening* as a procedural step in *enterprise hiring practices*.
+
+```{python}
+#| label: fig-bab-knn
+#| fig-cap: "KNN Elbow Diagram: Attrition Recall vs. Neighbors (Babushkin Dataset)"
+
+# Initialize variables for the Elbow Diagram...
+
+# We use f_classif which handles the strictly positive values from MinMaxScaler
+bab_selector = SelectKBest(score_func=f_classif, k=10)
+bab_X_train_selected = bab_selector.fit_transform(bab_X_train_sc, bab_y_train)
+bab_X_test_selected = bab_selector.transform(bab_X_test_sc)
+
+bab_selected_mask = bab_selector.get_support()
+bab_selected_features = np.array(bab_X_labels)[bab_selected_mask]
+
+print(f"kNN will now use only these {len(bab_selected_features)} features:")
+print(bab_selected_features)
+
+# Initialize variables for the Elbow Diagram
+bab_neighbors = range(1, 20)
+bab_knn_train_recall = {}
+bab_knn_test_recall = {}
+
+for neighbor in bab_neighbors:
+    # Initialize and Fit 
+    # Added weights='distance' to prevent the majority class from swamping the vote
+    bab_knn = KNeighborsClassifier(n_neighbors=neighbor, weights='distance')
+    bab_knn.fit(bab_X_train_selected, bab_y_train)
+    
+    # Predict
+    bab_y_pred_train_knn = bab_knn.predict(bab_X_train_selected)
+    bab_y_pred_test_knn = bab_knn.predict(bab_X_test_selected)
+    
+    # Calculate RECALL for the Positive Class (Attrition)
+    bab_knn_train_recall[neighbor] = recall_score(bab_y_train, bab_y_pred_train_knn)
+    bab_knn_test_recall[neighbor] = recall_score(bab_y_test, bab_y_pred_test_knn)
+
+# Plotting the Elbow Diagram anchored on Recall
+plt.figure(figsize=(10, 6))
+plt.title("KNN Elbow Diagram: Attrition Recall vs Neighbors (Babushkin Dataset)")
+plt.plot(bab_neighbors, list(bab_knn_train_recall.values()), label="Training Recall", marker='o')
+plt.plot(bab_neighbors, list(bab_knn_test_recall.values()), label="Testing Recall", marker='o')
+plt.legend()
+plt.xlabel("Number of Neighbors (k)")
+plt.ylabel("Recall (Sensitivity for Class 1: Attrition)")
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(bab_neighbors) 
+plt.show()
+
+# OVERRIDE: Hardcode the optimal k for business interpretability (work pod size)
+bab_best_k = 5
+print(f"Manually Selected for Interpretability: k={bab_best_k} with Test Recall of {bab_knn_test_recall[bab_best_k]:.4f}")
+
+# Train the finalized KNN model with the optimal k
+bab_knn_optimized = KNeighborsClassifier(n_neighbors=bab_best_k, weights='distance')
+bab_knn_optimized.fit(bab_X_train_selected, bab_y_train)
+bab_y_pred_knn = bab_knn_optimized.predict(bab_X_test_selected)
+
+# Pass the final results to the silent summary tracker
+classification_summary(
+    bab_y_test, 
+    bab_y_pred_knn, 
+    f'E: k-Nearest Neighbors', 
+    tuned_params=f"n_neighbors={bab_best_k}",
+    show_visuals=False
+)
+```
+
+Though the zenith of **recall** in @fig-bab-knn is met only at **$k=13$** or higher, a manual override of **$k=5$** is made to ground the implementation of this algorithim in *business practicality*:  While HR managers can meanigfully oversee and intervene in a *localized pod or team* of the employee's 5 closest peers, allowing the algorithm to optimize blindly and demand a *peer group* of 13 or more people would compromise its servicability as *peer groups* this large exceed *organizational spans of control* that most humans are capable of overseeing. 
+
+### Global Feature Importances (VIMS Facet Grid - Babushkin Dataset) {#sec-bab-vims}
+
+```{python}
+#| label: fig-bab-vims
+#| fig-cap: "Global Feature Importance by Algorithm (Babushkin Dataset)"
+
+# --- REFACTORED MASTER VISUAL FUNCTION ---
+
+# Model A: Standard Logistic Regression (Directional)
+store_feature_importances(bab_X_labels, bab_lr_classifier.coef_[0], 'A: Standard Logistic Regression', is_directional=True, dataset='Babushkin')
+
+# Model B: Regularized Ridge (Directional)
+store_feature_importances(bab_X_labels, bab_l2logreg_model.coef_[0], 'B: Regularized Logistic Regression', is_directional=True, dataset='Babushkin')
+
+# Model C: Linear SVM (Directional)
+store_feature_importances(bab_X_labels, bab_best_svm.coef_[0], 'C: Linear SVM (Tuned)', is_directional=True, dataset='Babushkin')
+
+# Model D: Decision Tree (Magnitude Only)
+store_feature_importances(bab_X_labels, bab_tree_model.feature_importances_, 'D: Decision Tree', is_directional=False, dataset='Babushkin')
+
+# Model E: kNN (Magnitude Only via ANOVA F-Scores)
+store_feature_importances(bab_X_labels, bab_selector.scores_, f'E: kNN (k={bab_best_k})', is_directional=False, dataset='Babushkin')
+
+# Model F: Generalized Additive Model (Magnitude Only via Permutation Importance)
+bab_gam_perm_imp = permutation_importance(bab_gam_model, bab_X_test_sc, bab_y_test, n_repeats=5, random_state=42)
+store_feature_importances(bab_X_labels, bab_gam_perm_imp.importances_mean, 'F: Generalized Additive Model (GAM)', is_directional=False, dataset='Babushkin')
+
+# --- EXECUTE THE BABUSHKIN PLOT ---
+plot_vims_facet_grid(dataset='Babushkin')
+```
+
+Particularly arresting about @fig-bab-vims above is the contrast between both **Logistic Regression** models (**Models A & B**), while **Model A** insists that **`anxiety (M)`** and **`stag (A)`**(tenure) are dominant in ascertaining *flight risk*, **Model B** favors Role based and situational factors like  **`hr_profession (R)`** and **`way_foot (S)`**. This occurs due to the **L2 penalization** implemented by **Model B** which eradicates **`anxiety (M)`** and deprioritizes **`stag (A)`**. This informs us that the baseline model was taken in by correlated noise but by the day to day realities of their incumbent role (**`hr_profession (R)`**) and the logistical ease of their commute (walking to work acting as a massive *retention anchor* via the  **`way_foot (S)`**)
+
+A noticable drop off in feature importance also presents itself in @fig-bab-vims with **Model D (Decision Tree)**, while the **linear models** distribute importance across a wide curve, the **decision tree** restricts its prioritization to merely four variables with **`stag (A)`** topping the list followed distantly by **`traffic_Job_Boards (S)`**, **`selfcontrol (M)`**, and **`independ (M)`**. This in part due to the computational nature of **decision trees** in being liberated from charting gradual psychological probabilities or drawing straight lines. Metrics like **Gini impurity** or **log-loss** are instead operationalized to aggressively hunt for the single cleanest mathematical cut that divides stayers from leavers.
+This suggests that if HR managers are to fashion a hard *binary alert system* to flag turnover, they would be well advised to ignore psychological surveys entirely. **Model D** champions **`stag (A)`** as the most mathematically pure threshold to flag a *flight risk*, making almost all other features computationally irrelevant for the initial operational filter.
+
+Gleaning at @fig-bab-vims above in a more wholistic sense, an observable consensus between the **linear models** emerges that **`anxiety (M)`** is the most crucial *retention factor*, this congruence between models is credible due to varied geometric approaches each model takes en route to this conclusion: **Model A** uses **maximum likelihood estimation** to find a trend across the entire workforce. **Model C**, however, only cares about the **support vectors** (i.e, the specific employees sitting right on the mathematical boundary between staying and leaving).
+
+In enterprise context this means **Model A** postulates that high anxiety serves as a *retention anchor* for the global workforce while **Model C** offers a more surgical conclusion: for the employees who face imminent attrition risk (the **support vectors** teetering on the edge of the *flight risk* boundary), their level of *risk aversion* (anxiety) is the definitive tie-breaker that keeps them in their seats.
+
+**Model E** serves to marry some of the divergent perspectives (logistical and psychological) of the models discussed above by **`way_foot (S)`** , **`hr_profession (R)`** , and **`anxiety (M)`** as its top magnitude drivers which lends itself well to the idea that HR managers can seldom afford to overlook the impact of physical logistics (having to walk or take public transit to work) and base line *risk aversion* (i.e employees forming "*continuance committments*" with their employer due to latent or realized fears of job loss).
+
+Finally, **Model F** violently deviates from any consensus observed in **Models A through E** in its elevation of **`industry_Retail_Services (R)`** and **`traffic_Job_Boards (S)`** to its absolute top spots and in doing so reveals that industry placement (specifically being in Retail) and sourcing origin (Job Boards) possess highly complex, non-linear relationships with turnover at Babushkin. Thereby **Model F** hints that the *attrition curves* for job board sourced retail workers distinguish themselves from their other enterprise counterparts.
+
+
+### Logistic GAM Partial Dependence Plots (Babushkin Dataset) {#sec-bab-gam}
+
+In this section, the exploration of binary dummy variables via **Partial Dependence Plots** are avoided due to the purpose of **PDP plots** being oriented towards visualizing the marginal effect of a feature across a continuous spectrum. As a result, when **PDP plots** are implemented on binary dummy variables like the **`industry_Retail_Services (R)`** flagged as a top *attrition/retention factor* by **Model F**, the results often reveal themselves to be disjointed step functions with minimal interpretive value. Therefore, in order to sufficiently channel the **spline** capabilities of the **GAM**, the pipeline intentionally bypassed those categorical variables to plot the top continuous drivers: **`anxiety (M)`**, **`novator (M)`**, and **`selfcontrol (M)`**
+
+
+```{python}
+#| label: fig-bab-pdp
+#| fig-cap: "Non-Linear Feature Effects for Top Continuous Drivers (Babushkin GAM)"
+
+# --- MODEL F: PARTIAL DEPENDENCE PLOTS (BABUSHKIN) ---
+# 1. Explicitly select the Top 3 CONTINUOUS features from the GAM VIMS
+# Bypassing binary flags (like Retail_Services) because line-plot PDPs for discrete 0/1 data are visually misleading
+bab_top_3_gam_features = ['anxiety (M)', 'novator (M)', 'selfcontrol (M)']
+
+# Find their exact column indices in the scaled X matrix
+bab_top_3_indices = [bab_X_labels.index(feat) for feat in bab_top_3_gam_features]
+
+# 2. Create the 3x1 Grid
+fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(10, 15))
+
+for i, (feat, idx) in enumerate(zip(bab_top_3_gam_features, bab_top_3_indices)):
+    ax = axes[i]
+    
+    # Generate the grid for the specific term
+    XX = bab_gam_model.generate_X_grid(term=idx)
+    
+    # Calculate dependence
+    pdp = bab_gam_model.partial_dependence(term=idx, X=XX)
+    
+    # Calculate confidence intervals
+    confi = bab_gam_model.confidence_intervals(XX, width=0.95)
+    
+    # Plotting the curve and the confidence bounds
+    ax.plot(XX[:, idx], pdp, color='purple', linewidth=2)
+    ax.fill_between(XX[:, idx], confi[:, 0], confi[:, 1], color='purple', alpha=0.2)
+    
+    # Baseline
+    ax.axhline(0, color='black', linestyle='--', linewidth=1.1)
+    
+    # Formatting
+    ax.set_title(f"PDP: {feat}", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Scaled Value (0 to 1)")
+    ax.set_ylabel("Partial Dependence (Log-Odds)")
+    
+    ax.grid(True, linestyle=':', alpha=0.6)
+
+fig.suptitle('Non-Linear Feature Effects: Top Continuous Drivers (Babushkin GAM)', fontsize=15, y=1.02)
+plt.tight_layout()
+plt.show()
+
+```
+
+The top-most visual in @fig-bab-pdp which explores the marginal effects of the **`anxiety (M)`** feature points to employee anxiety being a crucial *retention anchor* for the Babushkin enterprise, this is visibly confirmed by observing that for employees with zero anxiety (0.0), the **log odds** of attrition sit dangerously high in the positive *flight risk* territory (~+0.4). However, as the anxiety scale advances to the **X-axis** upper limit of 1.0, the curve plunges cleanly across the **zero-line**, bottoming out at roughly -0.4 and thus furnishes a counter-intuitive behavioral reality in that highly anxious employees are massive *retention anchors*, this also suggests a willingness among *disenamored employees* of the Babushkin organization to retain employment rather than take on a percieved gamble in the wider job market.
+
+The **PDP plot** for **`novator (M)`** is telling even in demonstrating zero **vertical variance** which signals that being an "innovator" has absolutely zero isolated predictive power regarding an employee's *flight risk* and that initiative and creativity alone cannot translate to *longevity* at the Babushkin organization.
+
+The middle plot in @fig-bab-pdp speaks to the virtues of restraint within Babushkin's workforce. This is because within the **PDP plot** for **`selfcontrol (M)`**, the **log-odds** curve hovers in the slightly positive/neutral zone for employees with low to moderate self-control (0.0 to ~0.5). But once the feature crosses the 0.6 threshold, the **spline** violently dips into the negative *safe zone*. This points to employees with high degrees of self control also having the *self regulative ability* to side step *emotionally driven impulsive decisions* to exit the enterprise.
+
+\clearpage
+
+### Decision Tree Attrition "Kill-Zones" (Babushkin Dataset) {#sec-bab-kzones}
+
+```{python}
+get_top_kill_zones(bab_tree_model, bab_X_labels, ['Stay', 'Exit'])
+```
+
+The **Kill zones** above readily reveal the expansive organization wide scope of *turnover* issues at the Babushkin workforce as each of these zones apply to anywhere from 20 to 27 % of the overall work force. This elevated scope suggests that *turnover* at Babushkin may well be more systemic and cultural than initally imagined by the other **predictive models** in past sections.  
+
+**Kill Zone 1** represents a mid-tenured group (**`stag (A)`** (*tenure*) between 2.73 and 27.09 months) of self motivated individuals (**`independ (M)`** > 5.15) and possesses the highest **attrition concentration** at 63.6%, this might serve to guide the Babushkin organization's HR managers in understanding that though employees might've survived *on boarding* and the *learning curve* of their roles,their self motivated natures also empower them to aggressively secure better offers elsewhere if dissatisfied with their employment, this is ostensibly due to the reality that by 27 months of *tenure* in the organizations, most individuals will not have been retained long enough to locked in by deep *seniority* or *institutional inertia*. 
+
+**Kill Zone 2** explores an identical *tenure group* as sequestered by **Kill Zone 1** but with *job sourcing* being the key differentiator of indicative *turnover intent*, since this group captures over 55% **attrition**, it signals to *HR leaders* that *enterprise talent sourcing strategies* cannot be understated in broader organizational efforts to stem *turnover*.
+
+**Kill Zone 3** finds itself as the third rung in a consensus between **decision tree paths** that mid-tenured groups at the Babushkin Organization are particularly beleaguered.
+This is because all 3 **Kill zones** confront different aspects of the exact same *tenure cohort* (**`stag (A)`** (*tenure*) between 2.73 and 27.09 months), with **Kill Zone 3** uniquely focusing on employees most in need of *managerial guidance* (**`independ (M)`** < 5.15).
+
+These observations taken altogether in tandem (from **Kill Zones 1 through 3**) inform us that the mid-tenure demographic is the single most vulnerable demographic in the Babushkin organization representing over 50% the workforce and that available remedial steps *enterprise HR* could take on include paying sufficeint mind to which streams employees are being hired from and the implementation of a dual pronged strategy for the *retention* of mid tenured individuals: for more independent employees (**`independ (M)`** > 5.15 seen in **Kill Zone 1**) managers must offer extreme *autonomy*, new challenges, and clear *upward mobility* so that *task boredom* does not give way to *professional listlessness* and for more dependent employees (**`independ (M)`** < 5.15 seen in **Kill Zone 3**), managers must provide heavy *mentorship*, *structural scaffolding*, and *continuous feedback* in order to avoiding burning out or overwhelming these employees.
+
+```{python}
+
+
+# --- PREP DATASET FOR SHAP (BABUSHKIN) ---
+# Re-attaching labels for readability in the waterfall plots
+bab_X_test_df = pd.DataFrame(bab_X_test_sc, columns=bab_X_labels)
+bab_X_train_df = pd.DataFrame(bab_X_train_sc, columns=bab_X_labels)
+
+# --- 1. MODEL A: Standard Logistic Regression ---
+bab_probas_a = bab_lr_classifier.predict_proba(bab_X_test_sc)[:, 1]
+bab_idx_a_min, bab_idx_a_max = np.argmin(bab_probas_a), np.argmax(bab_probas_a)
+bab_explainer_a = shap.LinearExplainer(bab_lr_classifier, bab_X_train_df)
+bab_shap_a = bab_explainer_a(bab_X_test_df)
+
+# --- 2. MODEL B: Regularized Logistic Regression ---
+bab_probas_b = bab_l2logreg_model.predict_proba(bab_X_test_sc)[:, 1]
+bab_idx_b_min, bab_idx_b_max = np.argmin(bab_probas_b), np.argmax(bab_probas_b)
+bab_explainer_b = shap.LinearExplainer(bab_l2logreg_model, bab_X_train_df)
+bab_shap_b = bab_explainer_b(bab_X_test_df)
+
+# --- 3. MODEL C: Linear SVM ---
+bab_scores_c = bab_best_svm.decision_function(bab_X_test_sc)
+bab_idx_c_min, bab_idx_c_max = np.argmin(bab_scores_c), np.argmax(bab_scores_c)
+bab_explainer_c = shap.LinearExplainer(bab_best_svm, bab_X_train_df)
+bab_shap_c = bab_explainer_c(bab_X_test_df)
+
+# --- 4. MODEL F: Generalized Additive Model (GAM) ---
+bab_probas_f = bab_gam_model.predict_proba(bab_X_test_sc)
+bab_idx_f_min, bab_idx_f_max = np.argmin(bab_probas_f), np.argmax(bab_probas_f)
+
+# We use a smaller background sample for GAM SHAP to speed up the kernel calculation
+bab_gam_bg = shap.sample(bab_X_train_df, 50) 
+bab_explainer_f = shap.Explainer(bab_gam_model.predict, bab_gam_bg)
+
+# Slicing just the min/max rows here, otherwise KernelExplainer takes forever to run
+bab_shap_f_safe = bab_explainer_f(bab_X_test_df.iloc[[bab_idx_f_min]], silent=True)
+bab_shap_f_risk = bab_explainer_f(bab_X_test_df.iloc[[bab_idx_f_max]], silent=True)
+```
+
+
+
+\clearpage
+
+### **SHAP Extreme Case Analysis**: The Safe Bets & *Flight Risks* at Babushkin {#sec-bab-shaps}
+
+
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-bab-shap-safe
+#| fig-cap: "SHAP Local Interpretability: Profiles with Lowest Attrition Probability (Babushkin)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Safest"
+#|   - "B: Reg. Logistic Regression - Safest"
+#|   - "C: Linear SVM (Tuned) - Safest"
+#|   - "F: GAM - Safest"
+
+# --- THE "SAFE" ANCHORS (Lowest Probabilities for Babushkin) ---
+# Calling the render_shap_waterfall function defined in the IBM section
+
+render_shap_waterfall(bab_shap_a[bab_idx_a_min], "")
+render_shap_waterfall(bab_shap_b[bab_idx_b_min], "")
+render_shap_waterfall(bab_shap_c[bab_idx_c_min], "")
+render_shap_waterfall(bab_shap_f_safe[0], "")
+```
+
+Across the diagnostic panel of most *retainable employees* in the Babushkin organization (@fig-bab-shap-safe) the **models** paneled here near unanimously agree on the profile of the most stable employees (1 = **`way_foot (S)`** and 1 = **`industry_Tech_Professional (R)`**) by categorizing employees who work in the Tech division and physically walk to work as being most insulated from *attrition risk*. The impact of *direct, active mentorship* from an employee's supervisor is also a crucial driver for *retention* as seen by the prominent placement of the (1 = **`coach_my head (R)`**) variable in @fig-bab-shap-safe, this finding is congruent with the canonical belief in HR circles that *adversarial relationships with direct supervisors* predict future *turnover events*.  
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-bab-shap-risk
+#| fig-cap: "SHAP Local Interpretability: Profiles with Highest Attrition Probability (Babushkin)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Riskiest"
+#|   - "B: Reg. Logistic Regression - Riskiest"
+#|   - "C: Linear SVM (Tuned) - Riskiest"
+#|   - "F: GAM - Riskiest"
+
+
+
+# --- THE "FLIGHT RISKS" (Highest Probabilities for Babushkin) ---
+
+render_shap_waterfall(bab_shap_a[bab_idx_a_max], "")
+render_shap_waterfall(bab_shap_b[bab_idx_b_max], "")
+render_shap_waterfall(bab_shap_c[bab_idx_c_max], "")
+render_shap_waterfall(bab_shap_f_risk[0], "")
+```
+
+When individualistically assessing the risks at the Babushkin organization via @fig-bab-shap-risk, it is apparent that yet another consensus emerges between the **models** about the profiles of the hardest employees to retain. Here the red bars driving the risk are (0.096 = **`anxiety (M)`**) and (0 = **`hr_profession (R)`**), in an HR context, the highest *flight risks* at Babushkin are employees outside the HR department who possess virtually zero *baseline anxiety*. Their fortitude empowers them with the *psychological confidence* to test the *open job market* and their departmental placement outside HR may well also point to a general dissatisfaction with the opacity of *enterprise workforce management decisions*.
+
+\clearpage
+
+### Model Performance Matrix (Babushkin Dataset) {#sec-bab-perf-matrix}
+
+The **performance matrix** in @tbl-bab-perf below readily presents itself with a potential pitfall in its highest ranked model (**Model B**). Securing an **Attrition recall** of 0.953 **Model B** seemingly demonstrates a near perfect capability to predict *turnover events*, however as is well understood in the tuning of **turnover classification models** the maximization of **Attrition recall** can only be realized with the sacrifice of **retention recall** as evidenced by **Model B's** retention **recall rate** which stands under 0.1. In practice, the implementation of **Model B** to flag attrition would lead to the squandering of *managerial bandwidth* and resources on *false-positive retention meetings* and related interventions.
+
+This disqualification of **Model B** grounds **Model E (kNN with k = 5)** as the true victor of the contest between **classifier models** in its securing of a highly respectable **Attrition Recall** of 0.721 while maintaining a balanced **Retention Recall** of 0.583. Therefore by utilizing localized and inherently manageable *peer groups* (k=5), **Model E** successfully flags nearly 3 out of 4 actual *flight risks* without the additional risk of profligate *turnover intervention* and thus yields the highest overall **F1-Score** (0.651) of all the tuned **models**.
+
+While an observer of @tbl-bab-perf may at once notice across the board that **$F_1$ scores** that top out at 0.6 might be low when held against the **classification metrics** produced by sterile financial models or clinical data, it should be noted that the Babushkin dataset was already perfectly balanced at the onset as mentioned in the introduction of @sec-bab-res, these **models** were therefore stripped of their ability to artificially inflate their **accuracy** or **F1-Scores** by simply blindly guessing the **majority class** (employees who end up staying). A behavioral explanation for this tendency may lie in the Babushkin dataset's characteristic reliance on psychological traits gathered from self reported survey data which tend to suffer from noisiness and subjectivity as well as bear the risk of potentially dishonest reporting from survey respondents.
+
+```{python}
+#| label: tbl-bab-perf
+#| tbl-cap: "Consolidated Algorithm Performance and Hyperparameters (Babushkin Dataset)"
+
+# 4. Universal Performance Matrix (Babushkin Dataset)
+# Convert the populated results dictionary into a master dataframe
+bab_performance_df = pd.DataFrame(results_dict)
+
+# Using regex to strip out numpy wrappers from the hyperparameter strings so the table looks clean
+bab_performance_df['tuned hyperparameters'] = bab_performance_df['tuned hyperparameters'].apply(
+    lambda x: re.sub(r"np\.\w+\(([^)]+)\)", r"\1", str(x))
+)
+
+# Rename columns to match formal Capstone rubric terminology
+bab_performance_df = bab_performance_df.rename(columns={
+    'specificity': 'Retention Recall (Class 0)',
+    'sensitivity': 'Attrition Recall (Class 1)',
+    'f1 score': 'F1-Score (Weighted)'
+})
+
+# Sort and rank the models by Attrition Recall (Our primary optimization metric)
+bab_performance_df['Rank'] = bab_performance_df['Attrition Recall (Class 1)'].rank(ascending=False, method='min')
+bab_performance_df = bab_performance_df.set_index('Rank').sort_index(ascending=True)
+
+# Format to 3 decimal places for a clean, academic presentation
+bab_performance_df = bab_performance_df.round(3)
+
+#print("\n=== Babushkin Dataset: Consolidated Algorithm Performance ===")
+
+# Convert the dataframe to a native Markdown table so Quarto automatically wraps the text
+display(Markdown(bab_performance_df.to_markdown()))
+```
+
+```{python}
+# ==========================================
+# PART 3: THE DATA SCIENTIST JOB CHANGE PIPELINE
+# ==========================================
+
+# 1. Ingest the Raw Data
+# (Ensure 'dsjobchange.csv' is in your working directory)
+ds_df = pd.read_csv("dsjobchange.csv")
+
+# 2. Define the MARS Features (per Week 10 Text)
+ds_mars_columns = [
+    'target',                  # Target Variable (Attrition Flag)
+    'enrolled_university',     # Motivation: Education pursuit
+    'last_new_job',            # Motivation: Job-hopping velocity
+    'relevent_experience',     # Ability: Domain expertise
+    'experience',              # Ability: Total longitudinal experience
+    'company_size',            # Role Perception: Structural boundary
+    'company_type',            # Role Perception: Enterprise type
+    'training_hours',          # Role Perception: Formal onboarding
+    'city_development_index'   # Situational: Macro-environmental stressor
+]
+
+# 3. Drop Useless Features by Filtering
+ds_df = ds_df[ds_mars_columns]
+```
+
+
+```{python}
+
+# Fix 'experience' column: '<1' to 0, '>20' to 21, then cast to float
+ds_df['experience'] = ds_df['experience'].replace({'<1': 0, '>20': 21})
+ds_df['experience'] = pd.to_numeric(ds_df['experience'], errors='coerce')
+
+# Fix 'last_new_job' column: 'never' to 0, '>4' to 5, then cast to float
+ds_df['last_new_job'] = ds_df['last_new_job'].replace({'never': 0, '>4': 5})
+ds_df['last_new_job'] = pd.to_numeric(ds_df['last_new_job'], errors='coerce')
+
+# Impute any resulting NaNs in our new numerical columns with the median
+ds_df['experience'] = ds_df['experience'].fillna(ds_df['experience'].median())
+ds_df['last_new_job'] = ds_df['last_new_job'].fillna(ds_df['last_new_job'].median())
+
+# --- CATEGORICAL TRANSFORMATIONS ---
+
+# Fix the Excel date artifact in company_size
+ds_df['company_size'] = ds_df['company_size'].replace({'54697': '10-100'})
+# (Adding a safeguard for the other common Kaggle/Excel glitch just in case)
+ds_df['company_size'] = ds_df['company_size'].replace({'10/49': '10-49'}) 
+
+# Define the remaining purely categorical columns
+ds_cat_cols = [
+    'enrolled_university', 'relevent_experience', 
+    'company_size', 'company_type'
+]
+
+# Apply the Constant Imputation strategy to the text columns
+ds_df[ds_cat_cols] = ds_df[ds_cat_cols].fillna('Unknown')
+
+# One-Hot Encode the string categories into binary sparse matrices
+ds_df = pd.get_dummies(ds_df, columns=ds_cat_cols, drop_first=False, dtype=int)
+```
+
+```{python}
+# ==========================================
+# PART 4: DS JOB CHANGE MARS TAGGING & PREPROCESSING
+# ==========================================
+
+
+# 1. Separate Features (X) and Target (y)
+ds_y = ds_df['target']
+ds_X_vals = ds_df.drop('target', axis=1)
+
+# 2. Define the MARS Tag Map for Data Scientist Dataset
+# Based on Week 10 text justifications
+ds_mars_tag_map = {
+    # Motivation (Intrinsic upskilling & job velocity)
+    'enrolled_university': '(M)', 'last_new_job': '(M)',
+    
+    # Ability (Domain expertise & longitudinal history)
+    'relevent_experience': '(A)', 'experience': '(A)',
+    
+    # Role Perception (Structural boundaries & onboarding)
+    'company_size': '(R)', 'company_type': '(R)', 'training_hours': '(R)',
+    
+    # Situational (Macro-environmental stressor)
+    'city_development_index': '(S)'
+}
+
+# 3. Append MARS Tags to Feature Names
+ds_X_labels = []
+for col in ds_X_vals.columns:
+    tag = ''
+    for base_feature, mars_tag in ds_mars_tag_map.items():
+        # Using startswith() perfectly catches our new one-hot encoded columns 
+        # (e.g., 'company_size_10-100' will successfully catch the 'company_size' base tag)
+        if col.startswith(base_feature):
+            tag = mars_tag
+            break
+    ds_X_labels.append(f"{col} {tag}".strip())
+
+# Assign the updated labels back to the dataframe and extract values
+ds_X_vals.columns = ds_X_labels
+ds_X = ds_X_vals.values
+
+# 4. Target Encoding
+# Encoding target as integers to avoid model dtype warnings later
+le = LabelEncoder()
+ds_y = le.fit_transform(ds_y)
+
+# 5. Feature Scaling
+# MinMax scaling needed since SVM and kNN rely on distance metrics
+scaling_obj = MinMaxScaler()
+ds_X_sc = scaling_obj.fit_transform(ds_X)
+
+# 6. Train/Test Splitting
+# Create unscaled train/test splits (Used for Decision Trees)
+ds_X_train, ds_X_test, ds_y_train, ds_y_test = train_test_split(
+    ds_X, ds_y, test_size=0.15, random_state=16, stratify=ds_y
+)
+
+# Create scaled train/test splits (Used for Linear Models, SVM, and kNN)
+ds_X_train_sc, ds_X_test_sc = train_test_split(
+    ds_X_sc, ds_y, test_size=0.15, random_state=16, stratify=ds_y
+)[:2]
+
+```
+
+\clearpage
+
+## Results: Data Science Dataset {#sec-ds-res}
+
+As discussed in the Methods section of this study,the Data Science Job Change Dataset is large and imbalanced dataset, therefore the class weights rendered below will be used in the underlying hyperparameter tuning process to robustly penalize classification models for missing the minority class (attrition) in the target variable.
+
+Additionally, in the ETL (extract, transform, load) phase of compution, the columns `experience` and `last_new_job` columns contained string artifacts (like `<1`, `>20`, and `never`) that were coerced into continuous numeric variables by refactoring via Python dictionaries. Furthermore, in the vein of data preservation, missing or null valued categorical data was not dropped and instead imputed with a constant "Unknown" value before one-hot encoding.
+
+
+```{python}
+# --- CLEAN PRE-PROCESSING CONSOLE LOG (DS JOB CHANGE) ---
+
+# Compute raw weights for the DS dataset
+ds_raw_weights = compute_class_weight(class_weight='balanced', classes=np.unique(ds_y), y=ds_y)
+
+# Converting numpy floats to native python types so it prints cleanly
+ds_weights_dict = {int(cls): round(float(weight), 2) for cls, weight in zip(np.unique(ds_y), ds_raw_weights)}
+
+# We hardcode the original shape here in case the raw dataframe variable was overwritten during filtering
+ds_original_shape = (19158, 14)
+
+# Single-line consolidated print statement (with the \n for PDF wrapping)
+print(f"DS Job Change Dataset Pipeline | Shape Filtered: {ds_original_shape} -> {ds_df.shape}\nComputed Imbalance Weights: {ds_weights_dict}")
+
+print("\nFinal MARS-Tagged Features:")
+for label in ds_X_labels:
+    print(f" - {label}")
+```
+
+```{python}
+# --- RESET GLOBAL DICTIONARY FOR DS JOB CHANGE ---
+results_dict = {
+    'model name': [],
+    'tuned hyperparameters': [],
+    'specificity': [],
+    'sensitivity': [],
+    'f1 score': []
+}
+
+# --- Model A: Standard Logistic Regression ---
+ds_lr_classifier = LogisticRegression(random_state=12)
+ds_lr_classifier.fit(ds_X_train_sc, ds_y_train)
+
+ds_y_pred_lr = ds_lr_classifier.predict(ds_X_test_sc)
+
+# show_visuals explicitly set to False to prevent the confusion matrix from printing
+classification_summary(ds_y_test, ds_y_pred_lr, 'A: Standard Logistic Regression', show_visuals=False)
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    
+    # --- Model B: Regularized Logistic Regression ---
+    ds_logreg_params = {
+        "C": np.linspace(0.001, 1000, 10),
+        "solver": ['newton-cg', 'saga'],
+        "penalty": ['l2'],
+        "class_weight": [ds_weights_dict, None]
+    }
+    ds_logreg = LogisticRegression(max_iter=10000)
+
+    ds_logreg_grid = RandomizedSearchCV(ds_logreg, ds_logreg_params, random_state=6, n_iter=20, scoring='f1')
+    ds_logreg_grid.fit(ds_X_train_sc, ds_y_train)
+
+    ds_l2logreg_model = LogisticRegression(**ds_logreg_grid.best_params_)
+    ds_l2logreg_model.fit(ds_X_train_sc, ds_y_train)
+    ds_y_pred_l2_logreg = ds_l2logreg_model.predict(ds_X_test_sc)
+
+    classification_summary(
+        ds_y_test, 
+        ds_y_pred_l2_logreg, 
+        'B: Regularized Logistic Regression', 
+        tuned_params=ds_logreg_grid.best_params_,
+        show_visuals=False
+    )
+
+    # --- Model C: Linear SVM ---
+    ds_svm_params = {
+        "C": np.logspace(-3, 3, 20),
+        "class_weight": [ds_weights_dict]
+    }
+    ds_svm = LinearSVC(penalty='l2', loss='squared_hinge', dual=False, max_iter=20000)
+
+    ds_svm_grid = RandomizedSearchCV(ds_svm, ds_svm_params, random_state=21, scoring='f1')
+    ds_svm_grid.fit(ds_X_train_sc, ds_y_train)
+
+    ds_best_svm = ds_svm_grid.best_estimator_
+    ds_y_pred_svm = ds_best_svm.predict(ds_X_test_sc)
+
+    classification_summary(
+        ds_y_test, 
+        ds_y_pred_svm, 
+        'C: Linear SVM (Tuned)', 
+        tuned_params=ds_svm_grid.best_params_,
+        show_visuals=False
+    )
+
+    # --- Model D: Decision Tree ---
+    ds_tree_params = {
+        "max_depth": np.arange(3, 10, 2),
+        "min_samples_split": np.arange(2, 9, 1),
+        "min_samples_leaf": np.arange(20, 50, 10),
+        "criterion": ['gini', 'log_loss'],
+        "class_weight": [ds_weights_dict, None]
+    }
+    ds_tree = DecisionTreeClassifier(random_state=12)
+
+    ds_tree_grid = RandomizedSearchCV(ds_tree, ds_tree_params, random_state=6, n_iter=50, scoring='f1')
+    # Note: Decision Trees use the unscaled features (ds_X_train)
+    ds_tree_grid.fit(ds_X_train, ds_y_train)
+
+    ds_tree_model = DecisionTreeClassifier(**ds_tree_grid.best_params_, random_state=12)
+    ds_tree_model.fit(ds_X_train, ds_y_train)
+
+    ds_y_pred_dt = ds_tree_model.predict(ds_X_test)
+
+    classification_summary(
+        ds_y_test, 
+        ds_y_pred_dt, 
+        'D: Decision Tree', 
+        tuned_params=ds_tree_grid.best_params_,
+        show_visuals=False
+    )
+```
+
+```{python}
+# --- Model F: Generalized Additive Model (GAM) [DS OPTIMIZED] ---
+# Map the computed class weights to every individual sample in the training set
+ds_gam_sample_weights = np.array([ds_weights_dict[cls] for cls in ds_y_train])
+
+# OPTIMIZATION: Shrink the search space to 5 lambdas to drastically speed up render time
+ds_gam_lams = np.logspace(-2, 2, 5)
+
+# Dropping n_splines to 10 to speed up execution and prevent overfitting the noise
+ds_gam_model = LogisticGAM(n_splines=10)
+
+# Execute gridsearch with sample weights applied, progress bar suppressed, and math warnings silenced
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    ds_gam_model.gridsearch(
+        ds_X_train_sc, 
+        ds_y_train, 
+        lam=ds_gam_lams, 
+        weights=ds_gam_sample_weights, 
+        progress=False
+    )
+
+ds_y_pred_gam = ds_gam_model.predict(ds_X_test_sc)
+
+classification_summary(
+    ds_y_test, 
+    ds_y_pred_gam, 
+    'F: Generalized Additive Model (GAM)', 
+    tuned_params={'lam': round(float(ds_gam_model.lam[0][0]), 3)},
+    show_visuals=False
+)
+```
+
+### **kNN** Elbow Diagram & Feature Selection (Data Science Dataset) {#sec-ds-knn}
+
+As was the case with the IBM and Babushkin datasets in @sec-ibm-knn and @sec-bab-knn respectively, Python's Select K-best feature will be used to prune the large feature space down to the most influential 10 variables.
+
+```{python}
+#| label: fig-ds-knn
+#| fig-cap: "KNN Elbow Diagram: Attrition Recall vs. Neighbors (Data Science Dataset)"
+
+# Initialize variables for the Elbow Diagram...
+
+# We use f_classif which handles the strictly positive values from MinMaxScaler
+ds_selector = SelectKBest(score_func=f_classif, k=10)
+ds_X_train_selected = ds_selector.fit_transform(ds_X_train_sc, ds_y_train)
+ds_X_test_selected = ds_selector.transform(ds_X_test_sc)
+
+ds_selected_mask = ds_selector.get_support()
+ds_selected_features = np.array(ds_X_labels)[ds_selected_mask]
+
+print(f"kNN will now use only these {len(ds_selected_features)} features:")
+print(ds_selected_features)
+
+# Initialize variables for the Elbow Diagram
+ds_neighbors = range(1, 20)
+ds_knn_train_recall = {}
+ds_knn_test_recall = {}
+
+for neighbor in ds_neighbors:
+    # Initialize and Fit 
+    # Added weights='distance' to prevent the majority class from swamping the vote
+    ds_knn = KNeighborsClassifier(n_neighbors=neighbor, weights='distance')
+    ds_knn.fit(ds_X_train_selected, ds_y_train)
+    
+    # Predict
+    ds_y_pred_train_knn = ds_knn.predict(ds_X_train_selected)
+    ds_y_pred_test_knn = ds_knn.predict(ds_X_test_selected)
+    
+    # Calculate RECALL for the Positive Class (Attrition)
+    ds_knn_train_recall[neighbor] = recall_score(ds_y_train, ds_y_pred_train_knn)
+    ds_knn_test_recall[neighbor] = recall_score(ds_y_test, ds_y_pred_test_knn)
+
+# Plotting the Elbow Diagram anchored on Recall
+plt.figure(figsize=(10, 6))
+plt.title("KNN Elbow Diagram: Attrition Recall vs Neighbors (Data Scientist Dataset)")
+plt.plot(ds_neighbors, list(ds_knn_train_recall.values()), label="Training Recall", marker='o')
+plt.plot(ds_neighbors, list(ds_knn_test_recall.values()), label="Testing Recall", marker='o')
+plt.legend()
+plt.xlabel("Number of Neighbors (k)")
+plt.ylabel("Recall (Sensitivity for Class 1: Attrition)")
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(ds_neighbors) 
+plt.show()
+
+# Extract the exact best k dynamically based purely on max Test Recall
+ds_best_k = max(ds_knn_test_recall, key=ds_knn_test_recall.get)
+print(f"Peak Performance: k={ds_best_k} with Test Recall of {ds_knn_test_recall[ds_best_k]:.4f}")
+
+# Train the finalized KNN model with the optimal k
+ds_knn_optimized = KNeighborsClassifier(n_neighbors=ds_best_k, weights='distance')
+ds_knn_optimized.fit(ds_X_train_selected, ds_y_train)
+ds_y_pred_knn = ds_knn_optimized.predict(ds_X_test_selected)
+
+# Pass the final results to the silent summary tracker
+classification_summary(
+    ds_y_test, 
+    ds_y_pred_knn, 
+    f'E: k-Nearest Neighbors', 
+    tuned_params=f"n_neighbors={ds_best_k}",
+    show_visuals=False
+)
+
+```
+
+@fig-ds-knn above peaks at **$k=3$**, this is consequential in light of the optimal **k-values** produced by the other two datasets in this study (**k=7** for IBM and **k=5** for Babushkin).This hyper-localized **$k$-value** is likely a direct consequence of the dataset's massive footprint (over 19,000 records) which serves to liberate the **algorithm** from needing to cast a wide geometric net to find statistical peers. It can locate near-exact "clones" within a very tight radius. 
+
+The translation of this finding to *Enterprise HR realities* suggest that in massive enterprises (such as Global market leaders and the like), HR need not confine itself to broad *departmental averages* to predict *data scientist turnover*. Large *talent pools* permit the **algorithm** to surgically flag *flight risks* based on the historical behavior of just a hand full of perfectly matched peers, allowing for highly individualized *interventions*.
+
+\clearpage
+
+### Global Feature Importances (VIMS Facet Grid - Data Science Dataset) {#sec-ds-vims}
+
+@fig-ds-vims shows us that the **`city_development_index (S)`** feature achieves something uniquely rare in this study: absolute universal dominance as it is the foremost
+predictive feature among the entire panel of assembled **models** and in doing so completely overrides the diverging consensus seen in previous sections between **linear and non-linear models**.
+
+In a real word context, while it was observed in @sec-bab-res and @sec-ibm-res that internal *departmental metrics* such as overtime and bad managers drove turnover, *macro-economic gravity* is the lynchpin of *retention* among *Data Science Professionals*. This likely stems from the nature of the industry in sourcing *talent* with highly mobile and premium skillsets and can result in *location hopping* as *Data Science professionals* mature in their careers. This is observable in the panels for **Models A through C** in @fig-ds-vims called out by large **blue bars** which imply that if an emplyee is situated in a highly developed city or tech hub they tend to remain, however if located in a developing or lower tier market they are more likely to translate their experience and acument to roles located in more economically favorable geographies.
+
+Another striking element of @fig-ds-vims is the placement of a synthetically created category (**`company_size_Unknown (R)`**) as the second most powerful **predictive feature** in modeling *attrition*, once again across the entire panel of **predictive models**. This validates the earlier methodological decision to retain **null valued categorical data**. A possible reason for this is when translated to the realities of *workforce dynamics*, missing data is rarely actually random. If a *data scientist* is recorded as working for an enterprise of unknown or unrecorded size, it strongly implies their engagement in a highly volatile *early-stage startup*, a *shell company*, or an unstructured *gig-economy contract* such as free-lancing. 
+
+Furthermore, **Models A, B & C** state that having relevant experience is a **predictor** of *attrition* (indicated by **red bars** for the **`relevent_experience_Has relevent experience (A)`** feature). This speaks to the existence of a favorable and lucrative *job market* for mid-level or experienced *data science professionals* and consequently *HR departments* must be cognizant of *poaching risk* as they train and mature their *data science teams*.
+
+```{python}
+#| label: fig-ds-vims
+#| fig-cap: "Global Feature Importance by Algorithm (Data Science Dataset)"
+
+# --- POPULATE THE DS JOB CHANGE VIMS DATAFRAME ---
+from sklearn.inspection import permutation_importance
+
+# Model A: Standard Logistic Regression (Directional)
+store_feature_importances(ds_X_labels, ds_lr_classifier.coef_[0], 'A: Standard Logistic Regression', is_directional=True, dataset='DS_Job')
+
+# Model B: Regularized Ridge (Directional)
+store_feature_importances(ds_X_labels, ds_l2logreg_model.coef_[0], 'B: Regularized Logistic Regression', is_directional=True, dataset='DS_Job')
+
+# Model C: Linear SVM (Directional)
+store_feature_importances(ds_X_labels, ds_best_svm.coef_[0], 'C: Linear SVM (Tuned)', is_directional=True, dataset='DS_Job')
+
+# Model D: Decision Tree (Magnitude Only)
+store_feature_importances(ds_X_labels, ds_tree_model.feature_importances_, 'D: Decision Tree', is_directional=False, dataset='DS_Job')
+
+# Model E: kNN (Magnitude Only via ANOVA F-Scores)
+store_feature_importances(ds_X_labels, ds_selector.scores_, f'E: kNN (k={ds_best_k})', is_directional=False, dataset='DS_Job')
+
+# Model F: Generalized Additive Model (Magnitude Only via Permutation Importance)
+# Note: Permutation importance on 19k rows takes a moment, but is much faster than the initial gridsearch
+ds_gam_perm_imp = permutation_importance(ds_gam_model, ds_X_test_sc, ds_y_test, n_repeats=5, random_state=42)
+store_feature_importances(ds_X_labels, ds_gam_perm_imp.importances_mean, 'F: Generalized Additive Model (GAM)', is_directional=False, dataset='DS_Job')
+
+# --- EXECUTE THE DS JOB CHANGE PLOT ---
+plot_vims_facet_grid(dataset='DS_Job')
+```
+
+\clearpage
+
+### Logistic GAM Partial Dependence Plots (Data Science Dataset) {#sec-ds-gam}
+
+Observable at once from @fig-ds-pdp is that the **PDP plot** for the **`city_development_index (S)`** feature is that it does not trend downward in a straight line and instead violently spikes of a massive *flight risk* peak at around the 0.3 scale mark, The 0.3 mark can be understood to be *developing or mid-tier economic markets* and *Data Scientists* stationed in these areas pose extreme *flight risk* (well punctuated by the plot peaking at a **log odds** of 2.0 implying an 88% probability of *imminent turnover*). It can be inferred that *Data Scientists* are likely using these roles to embellish their professional resumes before parlaying them into offers at more attractive geographic market(represented by the deep plunge into the negative/*retention zone* at the 0.8 mark and beyond), which instructs us that *enterprise geography* is a revolving door for premium *talent*.
+
+The **PDP plot** for the **`last_new_job`** reveals the potential for *Infrastructural Traps* in the training of *data scientists*. This is visually observable on the plot as risk is deeply negative (safe) at the absolute 0.0 mark but climbs rapidly into the positive *flight-risk zone* and stays there. Green *data scientists* (where **`last_new_job (M) = 0`**) are temporarily anchored because they require massive *organizational infrastructure* such as *cloud computing subscriptions*, *distributed architecture*, and live *databases* to actually mature their skills in contemporary practice.  They are thus occupationally and technologically precluded from leaving till they leverage the enterprise to build competencies in *Cloud computing* (like AWS or Azure), once this leverage is secured the *retention anchor* vanishes, and they immediately shop those subsidized skills to competitors.
+
+Similarly, the plot for the **`training_hours`** exposes a 'sweet-spot' for training with an distinguishable nadir (its strongest *retention power*) around the 0.7 scaled mark which it breaks into after elevated *flight risk* seen at lower levels of training. After this localized dip the curve spikes back up toward the 0.9 and 1.0 marks. This indicates that For *data science professionals*, training is not just *corporate onboarding*; it is vital *technological upskilling*. Providing a substantial, heavy investment in their training (the 0.7 mark) secures deep loyalty because the enterprise is actively funding their *human capital*. However this investment poses risk of diminishing returns at the highest levels of training as if developing employees are starved of project work they are consequently starved of *psychological ownership*. The ensuing *task boredom* provides the impetus to direct the company's training resources to certify themselves for a job elsewhere.
+
+
+```{python}
+#| label: fig-ds-pdp
+#| fig-cap: "Non-Linear Feature Effects for Top Continuous Drivers (Data Science GAM)"
+
+# --- MODEL F: PARTIAL DEPENDENCE PLOTS (DS JOB CHANGE) ---
+# 1. Explicitly select the Top 3 CONTINUOUS features from the GAM VIMS
+# Bypassing binary flags (like company_size_Unknown) because line-plot PDPs for discrete 0/1 data are visually misleading
+ds_top_3_gam_features = ['city_development_index (S)', 'last_new_job (M)', 'training_hours (R)']
+
+# Find their exact column indices in the scaled X matrix
+ds_top_3_indices = [ds_X_labels.index(feat) for feat in ds_top_3_gam_features]
+
+# 2. Create the 3x1 Grid
+fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(10, 15))
+
+for i, (feat, idx) in enumerate(zip(ds_top_3_gam_features, ds_top_3_indices)):
+    ax = axes[i]
+    
+    # Generate the grid for the specific term
+    XX = ds_gam_model.generate_X_grid(term=idx)
+    
+    # Calculate dependence
+    pdp = ds_gam_model.partial_dependence(term=idx, X=XX)
+    
+    # Calculate confidence intervals
+    confi = ds_gam_model.confidence_intervals(XX, width=0.95)
+    
+    # Plotting the curve and the confidence bounds
+    ax.plot(XX[:, idx], pdp, color='purple', linewidth=2)
+    ax.fill_between(XX[:, idx], confi[:, 0], confi[:, 1], color='purple', alpha=0.2)
+    
+    # Baseline
+    ax.axhline(0, color='black', linestyle='--', linewidth=1.1)
+    
+    # Formatting
+    ax.set_title(f"PDP: {feat}", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Scaled Value (0 to 1)")
+    ax.set_ylabel("Partial Dependence (Log-Odds)")
+    
+    ax.grid(True, linestyle=':', alpha=0.6)
+
+fig.suptitle('Non-Linear Feature Effects: Top Continuous Drivers (DS GAM)', fontsize=15, y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+\clearpage
+
+### Decision Tree Attrition "Kill-Zones" (Data Science Dataset) {#sec-ds-kzones}
+
+```{python}
+get_top_kill_zones(ds_tree_model, ds_X_labels, ['Stay', 'Exit'])
+```
+
+
+All three **killzones** in @sec-ds-kzones are brought alive by a striking commonality in having the exact same **root node**: **`city_development_index (S) <= 0.62`**.
+The constructed **decision tree** therfore affirms our earlier inclination from @sec-ds-gam that *Data scientists* stationed in a *developing or lower-tier economic market* are inherently at *risk* thereby grounding the primacy of *geographic reality* in determining *turnover risk* in this industry.
+
+Also revealed in **Kill Zones 1 to 3** are the surgical lethality of *attrition risk* with respect to the *Attrition risk zones* seen in earlier sections like @sec-bab-kzones which encapsulated 20-27% of the entire workforce. Here, the Data Science **Kill Zones** are applicale to tiny **micro-cohorts (0.18% to 0.26% of the workforce)**. This indicates that *sectoral turnover* in the Data Science space is not the *company-wide cultural rot* like it was at the Babushkin enterprise but instead localized hyper-specific, and extraordinarily lethal (with **attrition concentrations sitting at a staggering 92.6% to 93.8%**) all but guaraunteeing *turnover* if these specific conditions are met.
+
+We also see divergent groups of *at-risk junior employees* with **Kill Zones 1 and 3**, here both **Kill zones** target a more seasoned cadre *Junior employees* (**`experience` <= 1.50**) who already possess *relevant industry background* (**`relevent_experience_No relevent experience` <= 0.50**)  with **training hours** serving to distinguish one cohort from the other as **Kill Zone 1** (**93.8% attrition**) captures juniors receiving moderate/heavy training (**between 47.5 and 86 hours**)and conversely **Kill Zone 3** (**92.6% attrition**) captures juniors receiving almost no training (**`training_hours` <= 19.50**). This speaks to the susceptability of *training programs* in being used as *launch pads* for *voluntary turnover* in the case of **Kill Zone 1** and to *stagnant career prospects* being the *attrition driver* for **Kill zone 3**.
+
+There are noticable glimpses of the *"Big Fish, Small Pond" Syndrome* presented by **Kill Zone 2** (**92.9% attrition**) which targets more *experienced professionals* (**`experience` > 1.50**) in *developing cities* (**`city_development_index` <= 0.62**) working at *small firms* (**`company_size_10-100` > 0.50**) with moderate training (**43 to 73.5 hours**). It is thus apparent that highighly *experienced data scientists* stationed in *small companies* within *mid-tier cities* quickly hit a *professional ceiling*. Sans the massive *computational infrastructure* of a larger enterprise their careers may be destined to outgrow their environment and inevitably defect to *market competitors*.
+
+\clearpage
+
+
+```{python}
+
+# --- PREP DATASET FOR SHAP (DS JOB CHANGE) ---
+# Re-attaching labels for readability in the waterfall plots
+ds_X_test_df = pd.DataFrame(ds_X_test_sc, columns=ds_X_labels)
+ds_X_train_df = pd.DataFrame(ds_X_train_sc, columns=ds_X_labels)
+
+# --- 1. MODEL A: Standard Logistic Regression ---
+ds_probas_a = ds_lr_classifier.predict_proba(ds_X_test_sc)[:, 1]
+ds_idx_a_min, ds_idx_a_max = np.argmin(ds_probas_a), np.argmax(ds_probas_a)
+ds_explainer_a = shap.LinearExplainer(ds_lr_classifier, ds_X_train_df)
+ds_shap_a = ds_explainer_a(ds_X_test_df)
+
+# --- 2. MODEL B: Regularized Logistic Regression ---
+ds_probas_b = ds_l2logreg_model.predict_proba(ds_X_test_sc)[:, 1]
+ds_idx_b_min, ds_idx_b_max = np.argmin(ds_probas_b), np.argmax(ds_probas_b)
+ds_explainer_b = shap.LinearExplainer(ds_l2logreg_model, ds_X_train_df)
+ds_shap_b = ds_explainer_b(ds_X_test_df)
+
+# --- 3. MODEL C: Linear SVM ---
+ds_scores_c = ds_best_svm.decision_function(ds_X_test_sc)
+ds_idx_c_min, ds_idx_c_max = np.argmin(ds_scores_c), np.argmax(ds_scores_c)
+ds_explainer_c = shap.LinearExplainer(ds_best_svm, ds_X_train_df)
+ds_shap_c = ds_explainer_c(ds_X_test_df)
+
+# --- 4. MODEL F: Generalized Additive Model (GAM) ---
+ds_probas_f = ds_gam_model.predict_proba(ds_X_test_sc)
+ds_idx_f_min, ds_idx_f_max = np.argmin(ds_probas_f), np.argmax(ds_probas_f)
+
+# Increased background to 100 for a more stable baseline on this larger dataset
+ds_gam_bg = shap.sample(ds_X_train_df, 100) 
+ds_explainer_f = shap.Explainer(ds_gam_model.predict, ds_gam_bg)
+
+# Slicing just the min/max rows here, otherwise KernelExplainer takes forever to run
+ds_shap_f_safe = ds_explainer_f(ds_X_test_df.iloc[[ds_idx_f_min]], silent=True)
+ds_shap_f_risk = ds_explainer_f(ds_X_test_df.iloc[[ds_idx_f_max]], silent=True)
+```
+
+### **SHAP Extreme Case Analysis**: The Safe Bets & *Flight Risks* for the Data Science dataset {#sec-ds-shaps}
+
+The panel of safest employees produced by @fig-ds-shap-safe validates the *geographical baseline* estabilished in @sec-ds-kzones and @sec-ds-gam as the prime driver of *retention* among *Data Science professionals*. As it pertains to *turnover* a noticable contrast also presents itself in these plots between the allure of *agile capital* on the one hand (inunciated by **`1 = company_type_Funded Startup (R)`** as a major **blue** *retention anchor*) and the aversion to *bureaucracy* on the other (seen as **`1 = company_type_Public Sector (R)`** as a **red** *attrition driver* in @fig-ds-shap-risk). This speaks to a trend of *data science profesionals* demanding agility backed by capital. They are highly retained by *well-funded startups* where they can build cutting-edge tech but chafe under the pressures endemic to the slow-moving, bureaucratic constraints of the *Public Sector* such as municpal budgets and the reliance of *public sector enterpises* on aging legacy tech stacks.  
+
+
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-ds-shap-safe
+#| fig-cap: "SHAP Local Interpretability: Profiles with Lowest Attrition Probability (Data Science)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Safest"
+#|   - "B: Reg. Logistic Regression - Safest"
+#|   - "C: Linear SVM (Tuned) - Safest"
+#|   - "F: GAM - Safest"
+
+# --- THE "SAFE" ANCHORS (Lowest Probabilities for Data Scientists) ---
+# Calling the render_shap_waterfall function defined in the IBM section
+
+render_shap_waterfall(ds_shap_a[ds_idx_a_min], "")
+render_shap_waterfall(ds_shap_b[ds_idx_b_min], "")
+render_shap_waterfall(ds_shap_c[ds_idx_c_min], "")
+render_shap_waterfall(ds_shap_f_safe[0], "")
+```
+
+\clearpage
+          
+The SHAPs profiles of the most likely leavers rendered in @fig-ds-shap-risk underscores the dangers of *Dual-Track Burnout* as across the **linear models**, **`1 = enrolled_university_Full time course (M)`** is a prominent **red bar** driving the employee's **risk profile** into the *danger zone* which evinces an incapacity among *data scientists* to meet the demands of a *professional career* and a rigorous academic curriculum if both are to take place concurrently. Therefore, *Enterprise HR* must flag full-time students as imminent *flight risks* as the cognitive load of this highly specialized, computationally heavy profession leaves no bandwidth for a full academic course load.
+
+```{python}
+#| layout-ncol: 2
+#| label: fig-ds-shap-risk
+#| fig-cap: "SHAP Local Interpretability: Profiles with Highest Attrition Probability (Data Science)"
+#| fig-subcap: 
+#|   - "A: Std Logistic Regression - Riskiest"
+#|   - "B: Reg. Logistic Regression - Riskiest"
+#|   - "C: Linear SVM (Tuned) - Riskiest"
+#|   - "F: GAM - Riskiest"
+
+# --- THE "FLIGHT RISKS" (Highest Probabilities for Data Scientists) ---
+
+render_shap_waterfall(ds_shap_a[ds_idx_a_max], "")
+render_shap_waterfall(ds_shap_b[ds_idx_b_max], "")
+render_shap_waterfall(ds_shap_c[ds_idx_c_max], "")
+render_shap_waterfall(ds_shap_f_risk[0], "")
+```
+
+\clearpage
+
+### Model Performance Matrix (Data Science Dataset) {#sec-ds-perf-matrix}
+
+```{python}
+#| label: tbl-ds-perf
+#| tbl-cap: "Consolidated Algorithm Performance and Hyperparameters (Data Science Dataset)"
+#| 
+# Convert the populated results dictionary into a master dataframe
+ds_performance_df = pd.DataFrame(results_dict)
+
+# Using regex to strip out numpy wrappers from the hyperparameter strings so the table looks clean
+ds_performance_df['tuned hyperparameters'] = ds_performance_df['tuned hyperparameters'].apply(
+    lambda x: re.sub(r"np\.\w+\(([^)]+)\)", r"\1", str(x))
+)
+
+# Rename columns to match formal Capstone rubric terminology
+ds_performance_df = ds_performance_df.rename(columns={
+    'specificity': 'Retention Recall (Class 0)',
+    'sensitivity': 'Attrition Recall (Class 1)',
+    'f1 score': 'F1-Score (Weighted)'
+})
+
+# Sort and rank the models by Attrition Recall (Our primary optimization metric)
+ds_performance_df['Rank'] = ds_performance_df['Attrition Recall (Class 1)'].rank(ascending=False, method='min')
+ds_performance_df = ds_performance_df.set_index('Rank').sort_index(ascending=True)
+
+# Format to 3 decimal places for a clean, academic presentation
+ds_performance_df = ds_performance_df.round(3)
+
+#print("\n=== Data Scientist Dataset: Consolidated Algorithm Performance ===")
+
+# Convert the dataframe to a native Markdown table so Quarto automatically wraps the text
+display(Markdown(ds_performance_df.to_markdown()))
+```
+
+
+@tbl-ds-perf demonstrates the unsuitability of standard **untuned and unoptimized models** on complex and imbalanced datasets via **Model A**'s dismal **Attrition recall** of **0.264** which implies the **model** fails in identifying 3 out of 4 employees at risk of *attrition* which affirms heavily the **ensemble approach** undertaken by this study.
+
+A similar deficiency was recorded in the performance of **Model E (kNN algorithm)** which despite offerring fascinating conceptual insights into *hyper-localized peer groups* ultimately floundered in **global predictive power** by securing an **Attrition Recall** of only **0.464**. This shows that while concluding that *turnover* may be inferred by a *data scientist's* three closest peers may be intuitive and digestible to *HR practicioners* it is not robust enough to serve as an *enterprise wide early warnings system* as it pertains to this dataset which is further substantiated by the observed outperformance by hard the bifurcations of the **Decision Tree** and the splines of the **GAM**.
+
+The aforementioned **Decision tree (Model D)** emerges as the victor of the contest between **predictive models** by achieving the highest **Attrition Recall** in the panel at **0.788** while also maintaining a highly respectable **Retention Recall** of **0.737**. This means the **decision tree** flags almost 80 percent of *flight risk* without overcommitting *HR* to specious *retention meetings* and also adds to the validity of the *attrition kill zones* conceptulized in @sec-ds-kzones.
+
+**Model D** is not alone in this efficacy and is closely followed by **Model F (Logistic GAM)** in performance and secures the highest **$F_1$ score** of the **ensemble** of **0.768** in tow with a **recall** only **1%** lower than **Model D**'s at  **0.778**. This performance equips *enterprise HR* with a more conservative alternative than **Decision trees** if so desired by offering a near identical computational and predictive safety net.
+
+# Limitations and Confounds of Study {#sec-lim-confounds}
+
+
+The Pipeline conceptualized and built in this study is subject to a following limitations and confounds:
+
++ Synthetic Baseline Confound (IBM Dataset):  Because this data set was fashioned by *Data Scientists* and wasn't compiled from documented or recorded human behavior it produces an unnatural mathematical cleanliness that cannot be replicated in *enterprise HR practice* owing to the irrational, chaotic "noise" of *real-world workforce dynamics* which often leads to messy data replete with **missing values** and incorrectly entered data.
+
++ Cultural Translation Pitfalls(Babushkin Dataset): Though not synthetic (like the IBM dataset) as it is an extraction from an Russian HRIS system, there yet exists a deep structural sparsity in this dataset, the cultural confound identified here is most saliently observed with variables like **`greywage`** that document endemic economic conditions not present globally. By coercing these localized variables into universal buckets like *"Situational Factors"*, the pipeline risks misinterpreting culturally specific *survival tactics* as standard *corporate behaviors* which could result in misdirection if adopted by multinational or foreign enterprises.
+
++ Adminstrative Masking of Information Gaps (Data Science Dataset): As introduced in @sec-ds-res, **missing or null valued data** was subjected to a **label imputation strategy** where every instance of **null values** in **categorical variables** was replaced with the **"Unknown"**. While this *data conservation practice* enabled the garnering of insights such as **`company_size_Unknown`** being discovered as a massive *flight risk signal* this **imputation strategy** is subject to the risk of **misclassifaction**. This is because treating the absence of data as a definitive behavioral feature assumes that the data is missing on purpose and dismisses the rather significant possibility of *organizational or departmental indolence*, *human error* and *data corruption* being the causes of missing categorical information.
+
++ The Static Illusion of Cross Sectional Data (Global Constraint): As all 3 datasets operationalzied by this study provide *cross sectional snapshots* rather than *longitudinal workforce assessments*. This could lead to costly oversimplifcations as human behavior and *motivation* are not static. If algorithmn are only able to adapt to snapshot data they cannot account for the trajectory of features over time such as *morale*. Using the IBM dataset as an example, if an employee had a **`JobSatisfaction`** score of 2 (on a scale of 0 to 4), this would suggest to the reader that the employee is a *flight risk* if the variable is interpretted under temporal isolation, however had there been additional context that the same employee's **`JobSatisfaction`** from a prior period was a score of 1, their score of 2 in the current period would instead divulge the incremental success of *retention efforts*.
+
+
+# Conclusion {#sec-conclusion}
+
+The defining characteristic of this study was the integration of the **MARS Model** (an *Organizational Behavior Framework*) with **Attrition Classification analysis** and subsequently the preferential integration of interpretable **Classification models** over their **black box** counterparts. The former aim which married the principles of *data science* to those of *data management*, allowed for the diagnosis of complex *human centric phenomena* like *Dual-Track Burnout* (@sec-ds-shaps), *Infrastructural Traps*(@sec-ds-gam), and the dangers of *"greywages"* (@sec-lim-confounds) which would have been imperceptible under the auspices of standard **numerical analysis**. The latter aim served to orient the output of this study in a praxis forward manner to the realities of *enterprise HR*. While foundational literature often presumes a strict trade-off between predictive accuracy and interpretability, the empirical reality of the Babushkin dataset challenges that dichotomy. Contemporary community benchmarks reveal that opaque **ensemble methods** like **Random Forests** typically plateau at **F1 scores** between 0.68 and 0.80 on this specific dataset. Given that the interpretable **models** in this study generated **F1 scores** spanning 0.400 to 0.857, they achieved highly competitive *predictive parity* without sacrificing structural transparency. Simply put, **blackboxes** might match our efficacy in informing us "who" will leave but remain mathematically incapable of informing us why. Hence the adoption of interpretable **models** enables **algorithmic logic** to better conform to business needs by providing transparent and operational logic rather than opaque prophecies.
+
+Furthermore, **Decision Trees (Model D)** and **Logistic GAM's (Model F)** emerged from the **modelling ensemble** as the most viable *enterprise tools* of the lot. In their isolation of otherwise subterranean *flight risks* (via **Decision Tree** *"Kill Zones"*) and their mapping of behavioral inflection points (via **GAM PDP** *"Sweet spots"*) they affirm that *HR departments* can proactively target *attrition* without relinquishing their data to unexplainable **algorithms**. 
+
+The future scope for the enhancement of this methodology can be undertaken from multiple paths. One path would lie in transcending the use of cross sectional data  operationalzied throhout this study via the compilation and standardization of longitudinal or time series datasets which secures the ability to track the *"temporal velocity"* of an employee's *morale* and *performance* over multiple quarters, rather than judging them on a single, static day.
+
+A second more action oriented path would involve the embedding of *"Kill Zone"* filters in a live *corporate environment* to facilitate pilot assessments of these filters in observing if *HR maqnagers* utilizing **MARS** insights might materially reverse adverse *turnover predictions* in real time with *interventional strategy*.
+
+While featuring an **ensemble of models** grounded in different **mathematical perspectives**, other interpretable **models** such as **K-Means Clustering** and **Stochastic Gradient Descent classifiers** may be paneled in future studies to ameliorate computational diversity. Similarly, while the use of techniques like the **constant imputation strategy** utilized in this study produces misinterpretive risk (@sec-ds-res), future iterations of this pipeline may benefit from the inclusion of advanced **imputation techniques** (like **MICE - Multiple Imputation by Chained Equations**). The diagnostic capabilites of this pipeline may also be bolstered with **Individual Conditional Expectation (ICE) plots** which visualize how a **machine learning model’s predictions** change for each observation when a specific feature varies, offers an alternative or a complementary inclusion to **SHAPs plots** for localized and individual inspections of *attrition risk*.
+
+

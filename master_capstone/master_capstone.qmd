@@ -1,0 +1,33 @@
+---
+title: "Predictive HR Analytics: An Interpretable MARS-Machine Learning Pipeline"
+author: "(Karan) RK Rajkumar"
+date: today
+format: 
+  pdf:
+    toc: true
+    toc-title: "Table of Contents"
+    toc-depth: 3
+    number-sections: true
+    colorlinks: true
+titlepage: true
+bibliography: master_references.bib
+csl: ieee.csl
+execute:
+  cache: true
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+\newpage
+
+{{< include intro.qmd >}}
+
+{{< include methods.qmd >}}
+
+{{< include results.qmd >}}
+
+\newpage
+# References {.unnumbered}
+<div id="refs"></div>
